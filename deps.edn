@@ -1,0 +1,28 @@
+{:paths ["src"]
+ :deps  {org.clojure/clojure       {:mvn/version "1.10.1"}
+         org.clojure/core.async    {:mvn/version "1.3.610"}
+         org.clojure/tools.cli     {:mvn/version "1.0.194"}
+         clj-commons/fs            {:mvn/version "1.5.2"}
+         com.taoensso/encore       {:mvn/version "3.9.2"}
+         com.taoensso/timbre       {:mvn/version "5.1.0"}
+         com.fzakaria/slf4j-timbre {:mvn/version "0.3.20"}
+         net.cgrand/xforms         {:mvn/version "0.19.2"}
+         clojure.java-time         {:mvn/version "0.3.2"}
+         datalevin                 {:mvn/version "0.3.12"}
+         funcool/cuerdas           {:mvn/version "2020.03.26-3"}
+         uncomplicate/fluokitten   {:mvn/version "0.9.1"}
+         meander/epsilon           {:mvn/version "0.0.512"}
+         hanse/danzig              {:git/url "https://github.com/ribelo/danzig"
+                                    :sha     "5cfb78ccabb1ff5ee9b00a3bdee940363a12ccb3"}
+         hanse/rostock             {:git/url "https://github.com/ribelo/rostock"
+                                    :sha     "fde8c0a0195ed370370e7cda1a5a3fcb1efd3eaa"}
+         hanse/lubeck              {:git/url "https://github.com/ribelo/lubeck"
+                                    :sha     "ac1dbc18f81c08bc4f6d4ecacc79960ecde57c5e"}
+         hanse/halle               {:git/url "https://github.com/ribelo/halle/"
+                                    :sha     "af149f909c23e17cbebb175d76b1ed3531efb1f1"}
+         ribelo/torgau             {:git/url "https://github.com/ribelo/torgau"
+                                    :sha     "d5f9d7f43c7cd5b603cb2c0c9c976555567f3d00"}
+         ribelo/yf                 {:git/url "https://github.com/ribelo/yf/"
+                                    :sha     "27e405c807beb4f64b3985613a1b20a5e340b5c5"}}
+ :aliases {:depstar
+           {:extra-deps {seancorfield/depstar {:mvn/version "1.0.97"}}}}}
