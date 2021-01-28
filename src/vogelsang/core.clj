@@ -2,23 +2,13 @@
   (:require
    [taoensso.encore :as e]
    [clojure.tools.cli :as cli]
-   [clojure.core.async :as a]
-   [datalevin.core :as d]
    [taoensso.timbre :as timbre]
-   [vogelsang.db :as db]
    [vogelsang.data :as data]
    [vogelsang.allocation]
    [vogelsang.quant]
-   [hanse.danzig :refer [=>> +>>]]
-   [ribelo.torgau :as org]
    [cuerdas.core :as str]
-   [hanse.rostock.stats :as stats]
-   [hanse.lubeck.quant :as quant]
-   [hanse.lubeck.redp :as redp]
-   [net.cgrand.xforms :as x]
    [uncomplicate.fluokitten.jvm]
-   [uncomplicate.fluokitten.core :as fk]
-   [meander.epsilon :as r]
+   [meander.epsilon :as m]
    [vogelsang.api :as api])
   (:gen-class))
 
@@ -74,28 +64,29 @@
                (str (or s "  ") "    " l \newline "        " d)))
        (str/join (str \newline \newline))))
 
+(-main "portfolio" "-h")
+
 (defn -main [& args]
   (let [opts (cli/parse-opts args cli-opts :in-order true)]
-    (r/match opts
+    (m/match opts
       {:options {:verbose true}} (timbre/set-level! :debug)
       _ (timbre/set-level! :info))
 
-    (r/match opts
+    (m/match opts
       {:options {:help true}}    (println (str (usage cli-opts)
                                                "\n\n      portfolio"))
       {:options {:version true}} (println (str/join "." version))
 
-      {:options {:set-symbols-to-download (r/some ?symbols)}}
+      {:options {:set-symbols-to-download (m/some ?symbols)}}
       (let [symbols (->> (str/split ?symbols #",|\s") (filterv not-empty))]
-        (println symbols)
         (vogelsang.data/set-symbols-to-download symbols))
 
-      {:options {:add-symbols-to-download (r/some ?symbols)}}
+      {:options {:add-symbols-to-download (m/some ?symbols)}}
       (let [symbols (->> (str/split ?symbols #",|\s") (filterv not-empty))]
         (doseq [symbol symbols]
           (vogelsang.data/add-symbol-to-download symbol)))
 
-      {:options {:remove-symbols-to-download (r/some ?symbols)}}
+      {:options {:remove-symbols-to-download (m/some ?symbols)}}
       (let [symbols (->> (str/split ?symbols #",|\s") (filterv not-empty))]
         (doseq [symbol symbols]
           (vogelsang.data/remove-symbol-to-download symbol)))
@@ -103,12 +94,12 @@
       {:options {:list-symbols-to-download true}}
       (println (vogelsang.data/symbols-to-download))
 
-      {:options {:refresh-symbol (r/some ?symbol)}}
+      {:options {:refresh-symbol (m/some ?symbol)}}
       (do
         (api/refresh-symbol! ?symbol)
         (api/refresh-quant! ?symbol))
 
-      {:options {:delete-symbol (r/some ?symbol)}}
+      {:options {:delete-symbol (m/some ?symbol)}}
       (api/delete-symbol! ?symbol)
 
       {:options {:refresh-symbols true}}
@@ -120,6 +111,10 @@
 
       {:arguments ["portfolio" & ?args]}
       (let [popts (cli/parse-opts ?args portfolio-opts)]
-        (api/portfolio (:options popts)))
+        (m/match popts
+          {:options {:help true}}
+          (println (usage portfolio-opts))
+          _
+          (api/portfolio (:options popts))))
 
       _ "non exhaustive pattern match")))
