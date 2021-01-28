@@ -25,4 +25,13 @@
          ribelo/yf                 {:git/url "https://github.com/ribelo/yf/"
                                     :sha     "83898643e3003593613b3c08d582b297b200f756"}}
  :aliases {:depstar
-           {:extra-deps {seancorfield/depstar {:mvn/version "1.0.97"}}}}}
+           {:replace-deps               ; tool usage is new in 2.x
+            {seancorfield/depstar {:mvn/version "2.0.165"}}
+            ;; :ns-default hf.depstar
+            :exec-fn hf.depstar/uberjar
+            :exec-args {:jar "vogelsang.jar"
+                        :aot true
+                        ;; :ns-default hf.depstar
+                        ;; :compile true
+                        :main-class "vogelsang.core"
+                        }}}}

@@ -64,8 +64,6 @@
                (str (or s "  ") "    " l \newline "        " d)))
        (str/join (str \newline \newline))))
 
-(-main "portfolio" "-h")
-
 (defn -main [& args]
   (let [opts (cli/parse-opts args cli-opts :in-order true)]
     (m/match opts
@@ -115,6 +113,7 @@
           {:options {:help true}}
           (println (usage portfolio-opts))
           _
-          (api/portfolio (:options popts))))
+          (do (api/portfolio (:options popts))
+              (flush))))
 
       _ "non exhaustive pattern match")))
