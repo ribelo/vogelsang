@@ -4,7 +4,7 @@ use reqwest::{header, Url};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::client::SharedClient;
+use crate::client::Client;
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -16,26 +16,23 @@ struct LoginResponse {
     status_text: String,
 }
 
-impl SharedClient {
-    pub async fn login(&self) -> Result<&Self> {
-        let inner = &mut self.inner.try_lock().unwrap();
-        let base_url = &inner.paths.base_api_url;
-        let path_url = &inner.paths.login_url_path;
-        let url = Url::parse(base_url)?.join(path_url)?;
+impl Client {
+    pub async fn login(&mut self) -> Result<&Self> {
+        let paths = &self.paths.read().await;
+        let base_url = &paths.base_api_url;
+        let path_url = &paths.login_url_path;
+        let url = Url::parse(&base_url)?.join(&path_url)?;
         let body = json!({
             "isPassCodeReset": false,
             "isRedirectToMobile": false,
-            "password": &inner.password,
-            "username": &inner.username,
+            "password": &self.password,
+            "username": &self.username,
         });
-        let req = inner 
+        let req = self
             .http_client
             .post(url)
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.to_string())
-            .header(
-                header::REFERER,
-                &inner.paths.referer,
-            )
+            .header(header::REFERER, &paths.referer)
             .json(&body)
             .query(&[("reason", "session_expired")]);
 
@@ -43,7 +40,8 @@ impl SharedClient {
         match res.error_for_status() {
             Ok(res) => {
                 let body = res.json::<LoginResponse>().await?;
-                inner.session_id = body.session_id;
+                let mut session_id = self.session_id.write().await;
+                *session_id = body.session_id;
                 Ok(self)
             }
             Err(err) => Err(eyre!(err)),

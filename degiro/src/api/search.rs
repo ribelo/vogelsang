@@ -1,5 +1,8 @@
-use std::sync::Arc;
-
+use crate::api::product::Product;
+use crate::{
+    client::{Client, ClientMsg},
+    AllowedOrderTypes, OrderTimeTypes, ProductCategory,
+};
 use async_recursion::async_recursion;
 use chrono::NaiveDate;
 use color_eyre::{eyre::eyre, Result};
@@ -7,19 +10,19 @@ use derivative::Derivative;
 use reqwest::{header, Url};
 use serde::Deserialize;
 use serde_json::Value;
-
-use crate::{client::SharedClient, AllowedOrderTypes, ProductCategory, OrderTimeTypes};
-
-use super::product::Product;
+use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
+use tokio::time::Duration;
 
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct QueryBuilder {
+pub struct QueryBuilder<'a> {
     query: String,
     symbol: Option<String>,
     limit: u32,
     offset: u32,
-    client: SharedClient,
+    client: Arc<&'a Client>,
 }
 
 #[derive(Deserialize, Derivative, Clone)]
@@ -53,11 +56,10 @@ pub struct QueryProduct {
     pub symbol: String,
     pub tradable: bool,
     #[serde(skip)]
-    #[derivative(Debug = "ignore")]
-    pub(crate) client: Option<SharedClient>,
+    pub(crate) client_tx: Option<Sender<ClientMsg>>,
 }
 
-impl QueryBuilder {
+impl QueryBuilder<'_> {
     pub fn query(&mut self, query: &str) -> &mut Self {
         self.query = query.to_uppercase();
         self
@@ -76,17 +78,17 @@ impl QueryBuilder {
     }
     #[async_recursion]
     pub async fn send(&self) -> Result<Vec<QueryProduct>> {
-        let inner = self.client.inner.try_lock().unwrap();
+        let client = &self.client.clone();
         match (
-            &inner.session_id,
-            &inner.account,
-            &inner.paths.products_search_url,
+            &client.session_id,
+            &client.account,
+            &client.paths.products_search_url,
         ) {
             (Some(session_id), Some(account), Some(products_search_url)) => {
                 let url = Url::parse(products_search_url)?
                     .join(products_search_url)?
                     .join("v5/products/lookup")?;
-                let req = inner
+                let req = client
                     .http_client
                     .get(url)
                     .query(&[
@@ -96,15 +98,16 @@ impl QueryBuilder {
                         ("limit", &self.limit.to_string()),
                         ("offset", &self.offset.to_string()),
                     ])
-                    .header(header::REFERER, &inner.paths.referer);
+                    .header(header::REFERER, &client.paths.referer);
                 let res = req.send().await.unwrap();
                 match res.error_for_status() {
                     Ok(res) => {
                         let mut body = res.json::<Value>().await?;
                         if let Some(products) = body.get_mut("products") {
-                            let mut products = serde_json::from_value::<Vec<QueryProduct>>(products.take())?;
+                            let mut products =
+                                serde_json::from_value::<Vec<QueryProduct>>(products.take())?;
                             for mut p in products.iter_mut() {
-                                p.client = Some(self.client.clone())
+                                p.client_tx = Some(client.tx.clone());
                             }
                             if let Some(symbol) = &self.symbol {
                                 Ok(products
@@ -120,22 +123,16 @@ impl QueryBuilder {
                     }
                     Err(err) => match err.status().unwrap().as_u16() {
                         401 => {
-                            drop(inner);
-                            self.client.login().await?;
+                            client.login().await?;
                             self.send().await
                         }
                         _ => Err(eyre!(err)),
                     },
                 }
             }
-            (None, _, _) => {
-                drop(inner);
-                self.client.login().await?;
-                self.send().await
-            }
+            (None, _, _) => self.send().await,
             (Some(_), None, _) | (Some(_), _, None) => {
-                drop(inner);
-                self.client
+                client
                     .fetch_account_data()
                     .await?
                     .fetch_account_info()
@@ -146,25 +143,33 @@ impl QueryBuilder {
     }
 }
 
-impl SharedClient {
+impl Client {
     pub fn search(&self) -> QueryBuilder {
         QueryBuilder {
             query: Default::default(),
             symbol: None,
             limit: 1,
             offset: 0,
-            client: self.clone(),
+            client: Arc::new(self),
         }
     }
 }
 
 impl QueryProduct {
     pub async fn product(&self) -> Result<Arc<Product>> {
-        if let Some(client) = &self.client {
-            client.product_by_id(&self.id).await
-        } else {
-            Err(eyre!("client dosen't exists"))
-        }
+        let (tx, rx) = oneshot::channel::<Result<Arc<Product>>>();
+        self.client_tx
+            .as_ref()
+            .expect("channel don't exits")
+            .send_timeout(
+                ClientMsg::GetProduct {
+                    id: self.id.clone(),
+                    tx: Some(tx),
+                },
+                Duration::from_secs(10),
+            )
+            .await?;
+        rx.await?
     }
 }
 

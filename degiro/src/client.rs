@@ -1,12 +1,14 @@
-use std::sync::Arc;
-
-use color_eyre::Result;
+use crate::api::portfolio::Portfolio;
+use crate::{account::Account, api::product::Product, Period};
+use color_eyre::{Report, Result};
 use dashmap::DashMap;
 use derivative::Derivative;
 use erfurt::candle::Candles;
-use tokio::sync::Mutex;
-
-use crate::{account::Account, api::product::Product, Period};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::{oneshot, RwLock, Mutex};
+use tokio::task::JoinHandle;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Derivative)]
@@ -56,23 +58,61 @@ pub struct Paths {
     pub(crate) reporting_url: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum ClientMsg {
+    Login,
+    GetAccountInfo,
+    GetAccountData {
+        tx: Option<oneshot::Sender<Result<Account>>>,
+    },
+    GetPortfolio {
+        tx: Option<oneshot::Sender<Result<Portfolio>>>,
+    },
+    GetProduct {
+        id: String,
+        tx: Option<oneshot::Sender<Result<Arc<Product>>>>,
+    },
+    GetCandles {
+        id: String,
+        period: Period,
+        interval: Period,
+        tx: Option<oneshot::Sender<Result<Arc<Candles>>>>,
+    },
+}
+
+#[derive(Error, Debug)]
+pub enum ClientError {
+    #[error("Unauthorized")]
+    Unauthorized,
+    #[error("No account info")]
+    NoAccountInfo,
+    #[error("No account config")]
+    NoAccountConfig,
+    #[error("No account data")]
+    NoAccountData,
+    #[error(transparent)]
+    Unknown(#[from] Report),
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub struct Client {
+pub struct ClientInner {
     pub(crate) username: String,
     pub(crate) password: String,
-    pub(crate) session_id: Option<String>,
-    pub(crate) client_id: Option<i32>,
-    pub account: Option<Account>,
-    pub(crate) paths: Paths,
-    pub(crate) http_client: reqwest::Client,
+    pub(crate) session_id: Arc<RwLock<Option<String>>>,
+    pub(crate) client_id: Arc<RwLock<Option<i32>>>,
+    pub account: Arc<RwLock<Option<Account>>>,
+    pub portfolio: Arc<RwLock<Option<Portfolio>>>,
+    pub(crate) paths: Arc<RwLock<Paths>>,
+    pub(crate) http_client: Arc<reqwest::Client>,
     pub(crate) products_cache: Arc<DashMap<String, Arc<Product>>>,
-    pub(crate) quotes_cache: Arc<DashMap<(String, Period, Period), Candles>>,
+    pub(crate) quotes_cache: Arc<DashMap<(String, Period, Period), Arc<Candles>>>,
+    pub(crate) tx: Sender<ClientMsg>,
 }
 
 #[derive(Clone, Debug)]
-pub struct SharedClient {
-    pub inner: Arc<Mutex<Client>>,
+pub struct Client {
+    pub(crate) inner: Arc<Mutex<ClientInner>>,
 }
 
 #[allow(dead_code)]
@@ -95,12 +135,12 @@ impl ClientBuilder {
         self
     }
 
-    pub fn build(&self) -> Result<SharedClient> {
+    pub fn build(&self) -> Result<ClientInner> {
         let http_client = reqwest::ClientBuilder::new()
             .https_only(true)
             .cookie_store(true)
             .build()?;
-        let client = SharedClient::new(
+        let client = ClientInner::new(
             self.username.as_ref().unwrap().to_string(),
             self.password.as_ref().unwrap().to_string(),
             http_client,
@@ -109,30 +149,79 @@ impl ClientBuilder {
     }
 }
 
-impl Client {
+impl ClientInner {
     pub fn new(username: String, password: String, http_client: reqwest::Client) -> Self {
-        Self {
+        let (tx, rx) = channel(1024);
+        let mut client = Self {
             username,
             password,
             session_id: None,
             client_id: None,
-            account: None,
+            account: Arc::new(RwLock::new(None)),
+            portfolio: Arc::new(RwLock::new(None)),
             paths: Paths::default(),
             http_client,
             products_cache: Arc::new(DashMap::new()),
             quotes_cache: Arc::new(DashMap::new()),
-        }
+            tx,
+        };
+        // let handler = client.msg_handler(rx);
+        // tokio::spawn(async {
+        //     while let Ok(x) = shutdown_rx.await {
+        //         drop(rx);
+        //         drop(shutdown_tx);
+        //     }
+        // });
+        client
     }
-}
 
-impl SharedClient {
-    pub fn new(username: String, password: String, http_client: reqwest::Client) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Client::new(
-                username,
-                password,
-                http_client,
-            ))),
-        }
+    fn msg_handler(&mut self, mut rx: Receiver<ClientMsg>) -> JoinHandle<()> {
+        let mut client = self.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                use ClientMsg::*;
+                match msg {
+                    Login => {
+                        if let Err(err) = client.login().await {
+                            log::error!("{}", err);
+                        }
+                    }
+                    GetCandles {
+                        id,
+                        period,
+                        interval,
+                        tx,
+                    } => {
+                        if let Some(quotes) =
+                            client.quotes_cache.get(&(id, period, interval)).as_deref()
+                        {
+                            if let Some(tx) = tx {
+                                tx.send(Ok(quotes.clone()));
+                            };
+                        } else {
+                            let quotes = client.quotes(&id, &period, &interval).await;
+                            if let Some(tx) = tx {
+                                tx.send(quotes);
+                            };
+                        }
+                    }
+                    GetProduct { id, tx } => {
+                        if let Some(product) = client.products_cache.get(&id).as_deref() {
+                            if let Some(tx) = tx {
+                                tx.send(Ok(product.clone()));
+                            };
+                        } else {
+                            let product = client.product_by_id(&id).await;
+                            if let Some(tx) = tx {
+                                tx.send(product);
+                            };
+                        }
+                    }
+                    _ => {
+                        unimplemented!()
+                    }
+                };
+            }
+        })
     }
 }

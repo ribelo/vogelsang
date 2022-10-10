@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_recursion::async_recursion;
 use chrono::{prelude::*, Duration};
 use color_eyre::{eyre::eyre, Result};
@@ -5,8 +7,12 @@ use erfurt::candle::Candles;
 use reqwest::{header, Url};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
-use crate::{client::SharedClient, Period};
+use crate::{
+    client::{Client, ClientMsg},
+    Period,
+};
 
 use super::product::Product;
 
@@ -44,16 +50,15 @@ impl Quotes {
     }
 }
 
-impl SharedClient {
+impl Client {
     #[async_recursion]
-    pub async fn quotes(&self, id: &str, period: &Period, interval: &Period) -> Result<Candles> {
+    pub async fn quotes(&self, id: &str, period: &Period, interval: &Period) -> Result<Arc<Candles>> {
         let product = self.product_by_id(id).await?;
-        let inner = self.inner.try_lock().unwrap();
 
-        match inner.client_id {
+        match self.client_id {
             Some(client_id) => {
-                let url = Url::parse(&inner.paths.price_data_url)?;
-                let req = inner
+                let url = Url::parse(&self.paths.price_data_url)?;
+                let req = self
                     .http_client
                     .get(url)
                     .query(&[
@@ -64,7 +69,7 @@ impl SharedClient {
                         ("series", format!("ohlc:issueid:{}", &product.vwd_id)),
                         ("userToken", client_id.to_string()),
                     ])
-                    .header(header::REFERER, &inner.paths.referer);
+                    .header(header::REFERER, &self.paths.referer);
                 let res = req.send().await.unwrap();
                 match res {
                     res if res.status().is_success() => {
@@ -80,10 +85,14 @@ impl SharedClient {
                         let data = obj.get("data").ok_or(eyre!("can't get data"))?;
                         let quotes = serde_json::from_value::<Quotes>(data.clone())?;
                         let candles = quotes.as_candles(&product.symbol, start, interval)?;
+                        let candles = Arc::new(candles);
+                        self.quotes_cache.insert(
+                            (id.to_string(), period.clone(), interval.clone()),
+                            candles,
+                        );
                         Ok(candles)
                     }
                     res if res.status().as_u16() == 401 => {
-                        drop(inner);
                         let candles = self.login().await?.quotes(id, period, interval).await?;
                         Ok(candles)
                     }
@@ -91,7 +100,6 @@ impl SharedClient {
                 }
             }
             None => {
-                drop(inner);
                 self.fetch_account_config()
                     .await?
                     .quotes(id, period, interval)
@@ -102,12 +110,21 @@ impl SharedClient {
 }
 
 impl Product {
-    async fn quotes(&self, period: &Period, interval: &Period) -> Result<Candles> {
-        self.client
-            .as_ref()
-            .ok_or_else(|| eyre!("can't find client"))?
-            .quotes(&self.id, period, interval)
-            .await
+    async fn quotes(&self, period: &Period, interval: &Period) -> Result<Arc<Candles>> {
+        let (tx, rx) = oneshot::channel::<Result<Arc<Candles>>>();
+        &self.client_tx.as_ref()
+            .expect("channel don't exists")
+            .send_timeout(
+                ClientMsg::GetCandles {
+                    id: self.id.clone(),
+                    period: period.clone(),
+                    interval: interval.clone(),
+                    tx: Some(tx),
+                },
+                tokio::time::Duration::from_secs(10),
+            )
+            .await?;
+        rx.await?
     }
 }
 

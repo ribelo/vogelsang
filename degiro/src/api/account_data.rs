@@ -4,31 +4,32 @@ use async_recursion::async_recursion;
 use color_eyre::{eyre::eyre, Result};
 use reqwest::{header, Url};
 
-use crate::{account::Account, client::SharedClient};
+use crate::{account::Account, client::Client};
 
-impl SharedClient {
+impl Client {
     #[async_recursion]
     pub async fn fetch_account_data(&self) -> Result<&Self> {
-        let mut inner = self.inner.try_lock().unwrap();
-        match (&inner.session_id, &inner.paths.pa_url) {
+        let paths = self.paths.read().await;
+        let session_id = self.session_id.read().await.as_ref();
+        match (&session_id, &paths.pa_url) {
             (Some(session_id), Some(pa_url)) => {
                 let url = Url::parse(pa_url)?.join("client")?;
-                let req = inner
+                let req = self
                     .http_client
                     .get(url)
                     .query(&[("sessionId", &session_id)])
-                    .header(header::REFERER, &inner.paths.referer);
+                    .header(header::REFERER, &paths.referer);
                 let res = req.send().await?;
                 match res.error_for_status() {
                     Ok(res) => {
                         let mut body = res.json::<HashMap<String, Account>>().await?;
-                        let account = body.remove("data").ok_or(eyre!("data key not found"))?;
-                        inner.account = Some(account);
+                        let account_data = body.remove("data").ok_or(eyre!("data key not found"))?;
+                        let mut account = self.account.write().await;
+                        *account = Some(account_data);
                         Ok(self)
                     }
                     Err(err) => match err.status().unwrap().as_u16() {
                         401 => {
-                            drop(inner);
                             self.login().await?.fetch_account_config().await
                         }
                         _ => Err(eyre!(err)),
@@ -36,11 +37,9 @@ impl SharedClient {
                 }
             }
             (None, _) => {
-                drop(inner);
                 self.login().await?.fetch_account_data().await
             }
             (Some(_), None) => {
-                drop(inner);
                 self.login()
                     .await?
                     .fetch_account_config()
@@ -73,6 +72,6 @@ mod test {
             .fetch_account_data()
             .await
             .unwrap();
-        dbg!(&client.inner.lock().await.account);
+        dbg!(&client.account);
     }
 }

@@ -4,7 +4,7 @@ use color_eyre::{eyre::eyre, Result};
 use reqwest::{header, Url};
 use serde::Deserialize;
 
-use crate::client::SharedClient;
+use crate::client::Client;
 use async_recursion::async_recursion;
 
 #[allow(dead_code)]
@@ -55,37 +55,36 @@ pub struct Response {
     pub(crate) vwd_quotecast_service_url: String,
 }
 
-impl SharedClient {
+impl Client {
     #[async_recursion]
     pub async fn fetch_account_config(&self) -> Result<&Self> {
-        // let mut inner = self.inner.try_lock().unwrap();
-        // let url = Url::parse(&inner.paths.base_api_url)?.join(&inner.paths.account_config_path)?;
-        // let req = inner
-        //     .http_client
-        //     .get(url)
-        //     .header(header::REFERER, &inner.paths.referer);
-        // let res = req.send().await?;
-        // // Ok(self)
-        // match res.error_for_status() {
-        //     Ok(res) => {
-        //         let body = res.json::<HashMap<String, Response>>().await?;
-        //         let data = body.get("data").ok_or(eyre!("data key not found"))?;
-        //         inner.client_id = Some(data.client_id);
-        //         inner.paths.pa_url = Some(data.pa_url.clone());
-        //         inner.paths.products_search_url = Some(data.product_search_url.clone());
-        //         inner.paths.trading_url = Some(data.trading_url.clone());
-        //         inner.paths.reporting_url = Some(data.reporting_url.clone());
-        //         Ok(self)
-        //     }
-        //     Err(err) => match err.status().unwrap().as_u16() {
-        //         401 => {
-        //             drop(inner);
-        //             self.login().await?.fetch_account_config().await
-        //         }
-        //         _ => Err(eyre!(err)),
-        //     },
-        // }
-        Ok(self)
+        let mut paths = self.paths.write().await;
+        let url = Url::parse(&paths.base_api_url)?.join(&paths.account_config_path)?;
+        let req = self
+            .http_client
+            .get(url)
+            .header(header::REFERER, &paths.referer);
+        let res = req.send().await?;
+    
+        match res.error_for_status() {
+            Ok(res) => {
+                let body = res.json::<HashMap<String, Response>>().await?;
+                let data = body.get("data").ok_or(eyre!("data key not found"))?;
+                let mut client_id = self.client_id.write().await;
+                *client_id = Some(data.client_id);
+                paths.pa_url = Some(data.pa_url.clone());
+                paths.products_search_url = Some(data.product_search_url.clone());
+                paths.trading_url = Some(data.trading_url.clone());
+                paths.reporting_url = Some(data.reporting_url.clone());
+                Ok(self)
+            }
+            Err(err) => match err.status().unwrap().as_u16() {
+                401 => {
+                    self.login().await?.fetch_account_config().await
+                }
+                _ => Err(eyre!(err)),
+            },
+        }
     }
 }
 

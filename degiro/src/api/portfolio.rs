@@ -6,9 +6,10 @@ use serde_json::Value;
 use std::{collections::HashMap, convert::TryInto, sync::Arc};
 use strum::EnumString;
 use thiserror::Error;
+use tokio::time::{timeout, Duration};
 
 use crate::{
-    client::SharedClient,
+    client::{Client, ClientMsg},
     money::{Currency, Money},
 };
 
@@ -229,23 +230,22 @@ impl TryFrom<PortfolioObject> for Position {
     }
 }
 
-impl SharedClient {
+impl Client {
     #[async_recursion]
-    pub async fn portfolio(&self) -> Result<Portfolio> {
-        let inner = self.inner.try_lock().unwrap();
-        match (&inner.session_id, &inner.account, &inner.paths.trading_url) {
+    pub async fn portfolio(&mut self) -> Result<Portfolio> {
+        match (&self.session_id, &self.account, &self.paths.trading_url) {
             (Some(session_id), Some(account), Some(trading_url)) => {
                 let url = Url::parse(trading_url)?
-                    .join(&inner.paths.generic_data_path)?
+                    .join(&self.paths.generic_data_path)?
                     .join(&format!(
                         "{};jsessionid={}",
                         account.int_account, session_id
                     ))?;
-                let req = inner
+                let req = self
                     .http_client
                     .get(url)
                     .query(&[("portfolio", 0)])
-                    .header(header::REFERER, &inner.paths.referer);
+                    .header(header::REFERER, &self.paths.referer);
                 let res = req.send().await.unwrap();
                 match res.error_for_status() {
                     Ok(res) => {
@@ -257,7 +257,6 @@ impl SharedClient {
                             .ok_or(eyre!("value key not found"))?;
                         let objs: Vec<PortfolioObject> = serde_json::from_value(body.clone())?;
                         let mut portfolio = Portfolio::default();
-                        drop(inner);
                         for obj in objs {
                             let mut p: Position = obj.try_into()?;
                             if let Ok(product) = self.product_by_id(&p.id).await {
@@ -269,26 +268,27 @@ impl SharedClient {
                     }
                     Err(err) => match err.status().unwrap().as_u16() {
                         401 => {
-                            drop(inner);
-                            self.login().await?.portfolio().await
+                            self.tx
+                                .send_timeout(ClientMsg::Login, Duration::from_secs(10))
+                                .await;
+                            self.portfolio().await
                         }
                         _ => Err(eyre!(err)),
                     },
                 }
             }
             (None, _, _) => {
-                drop(inner);
-                self.login().await?.portfolio().await
+                self.tx
+                    .send_timeout(ClientMsg::Login, Duration::from_secs(10))
+                    .await;
+                self.portfolio().await
             }
-            (Some(_), _, _) => {
-                drop(inner);
-                self.login()
-                    .await?
-                    .fetch_account_data()
-                    .await?
-                    .portfolio()
-                    .await
-            }
+            // (Some(_), _, _) => {
+            //     self.tx
+            //         .send_timeout(ClientMsg::Login, Duration::from_secs(10))
+            //         .await;
+            //     // self.fetch_account_data().await?.portfolio().await
+            // }
         }
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::mpsc::Sender;
+
 use async_recursion::async_recursion;
 use chrono::prelude::*;
 use color_eyre::{eyre::eyre, Report, Result};
@@ -6,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use strum::EnumString;
 
-use crate::client::SharedClient;
+use crate::client::{Client, ClientMsg};
 use crate::money::Currency;
 use crate::{OrderTimeType, OrderType, TransactionType};
 use derivative::Derivative;
@@ -217,22 +219,20 @@ pub struct Order {
     size: i64,
     stop_price: f64,
     time_type: OrderTimeType,
-    #[derivative(Debug = "ignore")]
     #[serde(skip)]
-    client: Option<SharedClient>,
+    client_tx: Option<Sender<ClientMsg>>,
 }
 
-impl SharedClient {
+impl Client {
     #[async_recursion]
     pub async fn orders(&self) -> Result<HistoricOrders> {
-        let inner = self.inner.try_lock().unwrap();
-        match (&inner.session_id, &inner.account, &inner.paths.trading_url) {
+        match (&self.session_id, &self.account, &self.paths.trading_url) {
             (Some(session_id), Some(account), Some(trading_url)) => {
                 let url = Url::parse(trading_url)?.join(&format!(
                     "v5/update/{};jsessionid={}",
                     account.int_account, session_id
                 ))?;
-                let req = inner
+                let req = self
                     .http_client
                     .get(url)
                     .query(&[
@@ -240,7 +240,7 @@ impl SharedClient {
                         ("orders", &0.to_string()),
                         ("transactions", &0.to_string()),
                     ])
-                    .header(header::REFERER, &inner.paths.referer);
+                    .header(header::REFERER, &self.paths.referer);
                 let res = req.send().await.unwrap();
                 match res.error_for_status() {
                     Ok(res) => {
@@ -260,7 +260,6 @@ impl SharedClient {
                     }
                     Err(err) => match err.status().unwrap().as_u16() {
                         401 => {
-                            drop(inner);
                             Ok(self.login().await?.orders().await?)
                         }
                         _ => Err(eyre!(err)),
@@ -268,11 +267,9 @@ impl SharedClient {
                 }
             }
             (None, _, _) => {
-                drop(inner);
                 self.login().await?.orders().await
             }
             (Some(_), _, _) => {
-                drop(inner);
                 self.login()
                     .await?
                     .fetch_account_data()
@@ -312,7 +309,7 @@ mod test {
             size: 1,
             stop_price: 1.23,
             time_type: crate::OrderTimeType::Day,
-            client: None,
+            client_tx: None,
         };
         println!("{}", serde_json::to_string_pretty(&order).unwrap());
     }
@@ -326,7 +323,7 @@ mod test {
             size: 1,
             stop_price: 1.23,
             time_type: crate::OrderTimeType::Day,
-            client: None,
+            client_tx: None,
         };
         println!("{}", serde_json::to_string_pretty(&order).unwrap());
     }

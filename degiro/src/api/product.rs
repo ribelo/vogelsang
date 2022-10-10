@@ -1,16 +1,18 @@
-use std::{collections::HashMap, fmt::Debug, rc::Weak, sync::Arc, sync::Weak};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use async_recursion::async_recursion;
 use chrono::NaiveDate;
 use color_eyre::{eyre::eyre, Result};
-use dashmap::DashMap;
 use derivative::Derivative;
 use erfurt::candle::Candles;
 use reqwest::{header, Url};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc::Sender, oneshot};
+use tokio::time::Duration;
 
-use crate::{client::SharedClient, client::Client, AllowedOrderTypes, OrderTimeTypes, Period, ProductCategory};
+use crate::{
+    client::Client, client::ClientMsg, AllowedOrderTypes, OrderTimeTypes, Period, ProductCategory,
+};
 
 #[derive(Deserialize, Derivative, Clone)]
 #[derivative(Debug)]
@@ -50,26 +52,25 @@ pub struct Product {
     pub vwd_module_id_secondary: Option<i32>,
     #[serde(skip)]
     #[derivative(Debug = "ignore")]
-    pub(crate) client: Option<Weak<Client>>,
+    pub(crate) client_tx: Option<Sender<ClientMsg>>,
 }
 
-impl SharedClient {
+impl Client {
     #[async_recursion]
     pub async fn fetch_products<T>(&self, ids: T) -> Result<()>
     where
         T: Serialize + Sized + Send + Debug + Sync,
     {
-        let inner = self.inner.try_lock().unwrap();
         match (
-            &inner.session_id,
-            &inner.account,
-            &inner.paths.products_search_url,
+            &self.session_id,
+            &self.account,
+            &self.paths.products_search_url,
         ) {
             (Some(session_id), Some(account), Some(products_search_url)) => {
                 let url = Url::parse(products_search_url)?
                     .join(products_search_url)?
                     .join("v5/products/info")?;
-                let req = inner
+                let req = self
                     .http_client
                     .post(url)
                     .query(&[
@@ -77,7 +78,7 @@ impl SharedClient {
                         ("sessionId", session_id.to_string()),
                     ])
                     .json(&ids)
-                    .header(header::REFERER, &inner.paths.referer);
+                    .header(header::REFERER, &self.paths.referer);
                 let res = req.send().await.unwrap();
                 match res.error_for_status() {
                     Ok(res) => {
@@ -86,7 +87,7 @@ impl SharedClient {
                             .await?;
                         let m = body.remove("data").ok_or(eyre!("data key not found"))?;
                         for (k, mut v) in m.into_iter() {
-                            v.client = Some(self.clone());
+                            v.client_tx = Some(self.tx.clone());
                             self.products_cache.insert(k, Arc::new(v));
                         }
                         Ok(())
@@ -94,16 +95,9 @@ impl SharedClient {
                     Err(err) => Err(eyre!(err)),
                 }
             }
-            (None, _, _) => {
-                drop(inner);
-                self.login().await?.fetch_products(ids).await
-            }
-            (Some(_), None, _) => {
-                drop(inner);
-                self.fetch_account_data().await?.fetch_products(ids).await
-            }
+            (None, _, _) => self.login().await?.fetch_products(ids).await,
+            (Some(_), None, _) => self.fetch_account_data().await?.fetch_products(ids).await,
             (Some(_), Some(_), None) => {
-                drop(inner);
                 self.fetch_account_config().await?.fetch_products(ids).await
             }
         }
@@ -137,30 +131,22 @@ impl SharedClient {
 }
 
 impl Product {
-    pub async fn candles(&self, period: &Period, interval: &Period) -> Result<Candles> {
-        if let Some(quotes) = self
-            .quotes
-            .upgrade()
-            .ok_or_else(|| eyre!("can't upgrade quotes"))?
-            .get(&(period.clone(), interval.clone()))
-            .as_deref()
-        {
-            Ok(quotes.clone())
-        } else {
-            let quotes = self
-                .client
-                .as_ref()
-                .unwrap()
-                .quotes(&self.id, period, interval)
-                .await?;
-
-            self.quotes
-                .upgrade()
-                .ok_or_else(|| eyre!("can't upgrade quotes"))?
-                .insert((period.clone(), interval.clone()), quotes.clone());
-
-            Ok(quotes)
-        }
+    pub async fn candles(&self, period: &Period, interval: &Period) -> Result<Arc<Candles>> {
+        let (tx, rx) = oneshot::channel::<Result<Arc<Candles>>>();
+        self.client_tx
+            .as_ref()
+            .expect("channel don't exists")
+            .send_timeout(
+                ClientMsg::GetCandles {
+                    id: self.id.clone(),
+                    period: period.clone(),
+                    interval: interval.clone(),
+                    tx: Some(tx),
+                },
+                Duration::from_secs(10),
+            )
+            .await?;
+        rx.await?
     }
 }
 

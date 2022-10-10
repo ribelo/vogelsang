@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use std::collections::HashMap;
 
-use crate::client::SharedClient;
+use crate::client::Client;
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -107,22 +107,21 @@ impl From<String> for CashMovementType {
     }
 }
 
-impl SharedClient {
+impl Client {
     #[async_recursion]
     pub async fn account_state(
         &self,
         from_date: &NaiveDate,
         to_date: &NaiveDate,
     ) -> Result<Vec<CashMovement>> {
-        let inner = self.inner.try_lock().unwrap();
         match (
-            &inner.session_id,
-            &inner.account,
-            &inner.paths.reporting_url,
+            &self.session_id,
+            &self.account,
+            &self.paths.reporting_url,
         ) {
             (Some(session_id), Some(account), Some(reporting_url)) => {
                 let url = Url::parse(reporting_url)?.join("v6/accountoverview")?;
-                let req = inner
+                let req = self
                     .http_client
                     .get(url)
                     .query(&[
@@ -131,7 +130,7 @@ impl SharedClient {
                         ("fromDate", &&from_date.format("%d/%m/%Y").to_string()),
                         ("toDate", &&to_date.format("%d/%m/%Y").to_string()),
                     ])
-                    .header(header::REFERER, &inner.paths.referer);
+                    .header(header::REFERER, &self.paths.referer);
                 let res = req.send().await?;
                 match res.error_for_status() {
                     Ok(res) => {
@@ -146,7 +145,6 @@ impl SharedClient {
                     }
                     Err(err) => match err.status().unwrap().as_u16() {
                         401 => {
-                            drop(inner);
                             self.login().await?.account_state(from_date, to_date).await
                         }
                         _ => Err(eyre!(err)),
@@ -154,11 +152,9 @@ impl SharedClient {
                 }
             }
             (None, _, _) => {
-                drop(inner);
                 self.login().await?.account_state(from_date, to_date).await
             }
             (Some(_), _, _) => {
-                drop(inner);
                 self.login()
                     .await?
                     .fetch_account_data()
