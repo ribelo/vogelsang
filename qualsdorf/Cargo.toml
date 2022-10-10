@@ -1,0 +1,13 @@
+[package]
+name = "qualsdorf"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+color-eyre = "0.6.2"
+erfurt = { path = "../erfurt/" }
+float-cmp = "0.9.0"
+itertools = "0.10.3"
+statrs = "0.15.0"
