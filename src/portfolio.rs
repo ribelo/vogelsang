@@ -7,7 +7,6 @@ use degiro_rs::{
 use erfurt::candle::Candles;
 use erfurt::prelude::*;
 use nalgebra as na;
-use qualsdorf::prelude::*;
 use qualsdorf::{
     rolling_economic_drawdown::RollingEconomicDrawdownExt, sharpe_ratio::SharpeRatioExt, Indicator,
     ReturnExt,

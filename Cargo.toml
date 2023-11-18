@@ -35,3 +35,5 @@ strum = { version = "0.25.0", features = ["derive"] }
 nalgebra = "0.32.3"
 nalgebra-mvn = "0.14.0"
 tap = "1.0.1"
+tokio-stream = "0.1.14"
+tokio-util = { version = "0.7.10", features = ["codec"] }

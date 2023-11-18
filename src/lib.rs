@@ -4,7 +4,9 @@ pub mod data;
 pub mod portfolio;
 pub mod prelude;
 pub mod settings;
+pub mod tcp;
 
+#[derive(Debug, Clone)]
 pub struct App<T: degiro_rs::client::client_status::Status> {
     pub settings: settings::Settings,
     pub degiro: degiro_rs::client::Client<T>,

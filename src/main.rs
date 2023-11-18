@@ -1,3 +1,5 @@
+pub mod tcp;
+
 use anyhow::Result;
 use vogelsang::settings::Settings;
 use vogelsang::App;

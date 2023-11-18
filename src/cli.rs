@@ -1,3 +1,5 @@
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use comfy_table::{presets::UTF8_BORDERS_ONLY, Table};
@@ -17,6 +19,7 @@ use crate::{
     data::candles::CandlesHandler,
     portfolio::{RiskMode, SingleAllocation},
     prelude::*,
+    tcp::{self, ClientBuilder},
     App,
 };
 
@@ -73,6 +76,14 @@ pub enum Commands {
     RecalculateSl {
         #[clap(short, default_value = "3")]
         n: u32,
+    },
+    Server {
+        #[clap(short, long, default_value = "9123")]
+        port: u16,
+    },
+    Send {
+        #[clap(short, long, default_value = "9123")]
+        port: u16,
     },
 }
 
@@ -226,6 +237,23 @@ impl App<Unauthorized> {
                     .await;
                 calculator.remove_invalid().calculate().await;
                 print!("{}", calculator.as_table());
+            }
+            Commands::Server { port } => {
+                let addr = Ipv4Addr::new(127, 0, 0, 1);
+                let socket = SocketAddrV4::new(addr, port);
+                let app = self.clone().authorize().await?;
+                match tcp::Server::new(socket, app).await {
+                    Ok(mut server) => server.run().await,
+                    Err(err) => println!("{err}"),
+                }
+            }
+            Commands::Send { port } => {
+                let addr = Ipv4Addr::new(127, 0, 0, 1);
+                let socket = SocketAddrV4::new(addr, port);
+                let mut client = ClientBuilder::new(socket).build().await.unwrap();
+                if let Some(msg) = client.write(tcp::Msg::Ping).await {
+                    dbg!(msg);
+                }
             }
         };
         Ok(())
