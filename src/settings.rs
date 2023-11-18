@@ -1,18 +1,13 @@
 use config::Config;
-use degiro::{money::Money, Period};
+use degiro_rs::{money::Money, util::Period};
 use serde::Deserialize;
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Settings {
     pub username: String,
     pub password: String,
-    pub risk_free: f64,
-    pub risk: f64,
-    pub max_stock: u32,
-    pub money: Money,
-    pub period: Period,
-    pub interval: Period,
-    pub stocks: Vec<(String, String, String)>,
+    pub data_path: String,
+    pub assets: Vec<(String, String)>,
 }
 
 impl Settings {
@@ -28,6 +23,8 @@ impl Settings {
             )
             .build()
             .expect("Can't load config");
-        settings.try_deserialize::<Settings>().expect("Can't deserialize config")
+        settings
+            .try_deserialize::<Settings>()
+            .expect("Can't deserialize config")
     }
 }

@@ -1,11 +1,14 @@
-use axum::{http::header::HeaderMap, routing::get, Router};
-use color_eyre::{eyre::eyre, Result};
-use std::net::SocketAddr;
-use vogelsang::cmd;
+use anyhow::Result;
 use vogelsang::settings::Settings;
+use vogelsang::App;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let settings = Settings::new(None);
-    cmd::run(settings).await
+    let degiro = degiro_rs::client::ClientBuilder::default()
+        .username(&settings.username)
+        .password(&settings.password)
+        .build()?;
+    let app = App { settings, degiro };
+    app.run().await
 }

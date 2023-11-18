@@ -1,20 +1,98 @@
-use std::sync::Arc;
-
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use color_eyre::{eyre::eyre, Result};
-use degiro::{api::product::Product, Period};
-use ndarray::{Array, Array2, Dim, Array1};
+use degiro_rs::{
+    api::{product::Product, quotes::Quotes},
+    util::Period,
+};
+use erfurt::candle::Candles;
+use erfurt::prelude::*;
+use ndarray::{Array, Array2};
+use ndarray_linalg::Inverse;
+use ndarray_stats::CorrelationExt;
+use qualsdorf::prelude::*;
 use qualsdorf::{
-    annualized_return::AnnualizedReturnExt, mode::Geometric,
-    rolling_economic_drawdown::RollingEconomicDrawdownExt, sharpe_ratio::SharpeRatioExt, Return,
-    Value,
+    rolling_economic_drawdown::RollingEconomicDrawdownExt, sharpe_ratio::SharpeRatioExt, Indicator,
+    ReturnExt,
 };
 use statrs::statistics::Statistics;
+use strum::EnumString;
+
+#[derive(Debug)]
+pub struct LSV {
+    pub freq: usize,
+    pub input: Vec<f64>,
+    pub values: Vec<Option<f64>>,
+}
+
+impl LSV {
+    pub fn new(freq: usize) -> Self {
+        Self {
+            freq,
+            input: Vec::with_capacity(freq),
+            values: Vec::with_capacity(freq),
+        }
+    }
+}
+
+impl Indicator for LSV {
+    type Input = f64;
+    type Output = f64;
+
+    fn feed(&mut self, ret: Self::Input) {
+        // Add the raw return value to the input list
+        self.input.push(ret);
+
+        // If we have enough data, calculate the average of the last `self.freq` squared min elements
+        if self.input.len() >= self.freq {
+            let last_elements: Vec<f64> = self.input[self.input.len() - self.freq..].to_vec();
+            let sum: f64 = last_elements
+                .iter()
+                .map(|&x| f64::min(x, 0.0).powf(2.0))
+                .sum();
+            let count = last_elements.len() as f64;
+            let avg = sum / count;
+
+            // Calculate E[min(rt, 0)]^2
+            self.values.push(Some(avg));
+        } else {
+            self.values.push(None);
+        }
+    }
+
+    fn last(&self) -> Option<&Self::Output> {
+        self.values.last().and_then(|v| v.as_ref())
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = Option<&Self::Output>> + '_> {
+        Box::new(self.values.iter().map(Option::as_ref))
+    }
+}
+
+pub trait LsvExt: ReturnExt {
+    fn lsv(&self, freq: usize) -> Option<LSV> {
+        let mut indicator = LSV::new(freq);
+        if let Some(ret) = self.ret() {
+            ret.into_iter().for_each(|v| indicator.feed(v));
+            Some(indicator)
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> LsvExt for T where T: CandlesExt {}
+
+#[derive(Debug, Clone, EnumString)]
+pub enum RiskMode {
+    STD,
+    LSV,
+}
 
 #[async_trait]
 pub trait SingleAllocation {
     async fn single_allocation(
         &self,
+        mode: RiskMode,
         risk: f64,
         risk_free: f64,
         period: &Period,
@@ -26,150 +104,209 @@ pub trait SingleAllocation {
 impl SingleAllocation for Product {
     async fn single_allocation(
         &self,
+        mode: RiskMode,
         risk: f64,
         risk_free: f64,
         period: &Period,
         interval: &Period,
     ) -> Result<f64> {
-        let freq = period.to_owned() / interval.to_owned();
-        let candles = self.candles(period, interval).await?;
-        let ret = candles
-            .ret()
-            .ok_or_else(|| eyre!("can't calculate return"))?;
-        let std = ret.iter().std_dev();
-        let sr = candles
+        let candles: Candles = self.quotes(period, interval).await?.into();
+        candles
+            .single_allocation(mode, risk, risk_free, period, interval)
+            .await
+    }
+}
+
+#[async_trait]
+impl SingleAllocation for Quotes {
+    async fn single_allocation(
+        &self,
+        mode: RiskMode,
+        risk: f64,
+        risk_free: f64,
+        period: &Period,
+        interval: &Period,
+    ) -> Result<f64> {
+        Into::<Candles>::into(self)
+            .single_allocation(mode, risk, risk_free, period, interval)
+            .await
+    }
+}
+
+#[async_trait]
+impl SingleAllocation for Candles {
+    async fn single_allocation(
+        &self,
+        mode: RiskMode,
+        risk: f64,
+        risk_free: f64,
+        period: &Period,
+        interval: &Period,
+    ) -> Result<f64> {
+        let freq = period.div(interval);
+        let risk_metric = match mode {
+            RiskMode::STD => {
+                let ret = self
+                    .ret()
+                    .ok_or_else(|| anyhow!("can't calculate return"))?;
+                ret.iter().std_dev()
+            }
+            RiskMode::LSV => self
+                .lsv(freq)
+                .ok_or_else(|| anyhow!("can't calculate lsv"))?
+                .last()
+                .ok_or_else(|| anyhow!("can't get value"))?
+                .to_owned(),
+        };
+        let sr = self
             .sharpe_ratio(freq, risk_free)
-            .ok_or_else(|| eyre!("can't calculate sharpe ratio"))?
-            .value()
-            .ok_or_else(|| eyre!("can't get value"))?
+            .ok_or_else(|| anyhow!("can't calculate sharpe ratio"))?
+            .last()
+            .ok_or_else(|| anyhow!("can't get value"))?
             .to_owned();
-        let redp = candles
+        let redp = self
             .rolling_economic_drawndown(freq)
-            .ok_or_else(|| eyre!("can't calculate rolling economic drawdown price"))?
-            .value()
-            .ok_or_else(|| eyre!("can't get value"))?
+            .ok_or_else(|| anyhow!("can't calculate rolling economic drawdown price"))?
+            .last()
+            .ok_or_else(|| anyhow!("can't get value"))?
             .to_owned();
         let allocation = 1.0_f64.min(0.0_f64.max(
-            (((dbg!(sr) / dbg!(std)) + 0.5) / (1.0 - risk.powf(2.0)))
-                * 0.0_f64.max((dbg!(risk) - dbg!(redp)) / (1.0 - redp)),
+            dbg!(((sr / risk_metric) + 0.5) / (1.0 - risk.powf(2.0)))
+                * dbg!(dbg!(risk - redp) / (1.0 - redp)),
         ));
         Ok(allocation)
     }
 }
 
-pub struct ProductsSeq(pub Vec<Arc<Product>>);
+pub struct AssetsSeq(pub Vec<(Product, Candles)>);
 
-impl From<Vec<Arc<Product>>> for ProductsSeq {
-    fn from(xs: Vec<Arc<Product>>) -> Self {
-        ProductsSeq(xs)
+impl From<Vec<(Product, Candles)>> for AssetsSeq {
+    fn from(xs: Vec<(Product, Candles)>) -> Self {
+        AssetsSeq(xs)
     }
 }
 
-async fn redp_stats(
-    product: Arc<Product>,
-    risk: f64,
-    risk_free: f64,
-    period: &Period,
-    interval: &Period,
-) -> Result<Array<f64, Dim<[usize; 1]>>> {
-    let freq = period.clone() / interval.clone();
-    let candles = product.candles(period, interval).await?;
-    let ret = candles
-        .ret()
-        .ok_or_else(|| eyre!("can't calculate return"))?;
-    let std = ret.std_dev();
-    let ann_ret = candles
-        .annualized_return(Geometric, freq)
-        .ok_or_else(|| eyre!("can't calculate annualized return"))?
-        .value()
-        .ok_or_else(|| eyre!("can't get value"))?
-        .to_owned();
-    let redp = candles
-        .rolling_economic_drawndown(freq)
-        .ok_or_else(|| eyre!("can't calculate redp"))?
-        .value()
-        .ok_or_else(|| eyre!("can't get value"))?
-        .to_owned();
-    let drift = 0.0_f64.max((ann_ret - risk_free) + (std.powf(2.0) / 2.0));
-    let y = (1.0 / (1.0 - risk.powf(2.0))) * ((risk - redp) / (1.0 - redp));
-    Ok(Array::from_vec(vec![std, drift, y]))
-}
-
-impl ProductsSeq {
+impl AssetsSeq {
     pub async fn redp_multiple_allocation(
         &self,
+        mode: RiskMode,
         risk: f64,
         risk_free: f64,
         period: &Period,
         interval: &Period,
-        ) -> Result<Vec<(Arc<Product>, f64)>> {
-        let mut xs = Array2::<f64>::zeros((0, 3));
-        for p in self.0.clone() {
-            // TODO:
-            dbg!(&p.id, &p.name);
-            let stats = redp_stats(p, risk, risk_free, period, interval).await?;
-            xs.push_row(stats.view()).unwrap();
+        short_sales_constraint: bool,
+    ) -> Result<Vec<(Product, f64)>> {
+        let freq = period.div(interval);
+        let mut rets = Array2::<f64>::zeros((0, freq));
+        let mut ys = Vec::new();
+        let mut mu = Vec::new();
+        for (_p, candles) in self.0.clone() {
+            let ret = candles
+                .ret()
+                .ok_or_else(|| anyhow!("can't calculate return"))?;
+            rets.push_row(Array::from_vec(ret.clone()).view())?;
+            let risk_metric = match mode {
+                RiskMode::STD => ret.clone().std_dev(),
+                RiskMode::LSV => candles
+                    .lsv(freq)
+                    .ok_or_else(|| anyhow!("can't calculate lsv"))?
+                    .last()
+                    .ok_or_else(|| anyhow!("can't get value"))?
+                    .to_owned(),
+            };
+            let mean_ret = ret.mean();
+            let redp = candles
+                .rolling_economic_drawndown(freq)
+                .ok_or_else(|| anyhow!("can't calculate redp"))?
+                .last()
+                .ok_or_else(|| anyhow!("can't get value"))?
+                .to_owned();
+            let y = (1.0 / (1.0 - risk.powf(2.0))) * ((risk - redp) / (1.0 - redp));
+            let mut drift = mean_ret - risk_free + risk_metric.powf(2.0) / 2.0;
+            if short_sales_constraint {
+                drift = drift.max(0.0);
+            };
+            ys.push(y);
+            mu.push(drift);
         }
-        let std = xs.column(0);
-        let drift = xs.column(1);
-        let y = xs.column(2);
-        let inv_std = std.map(|x| x.powf(-1.0));
-        let matrix = inv_std * drift * y;
-        let sum = matrix.sum();
-        let mut r: Vec<(Arc<Product>, f64)> = Vec::new();
-        if sum <= 1.0 {
-            for (product, allocation) in self.0.iter().zip(matrix.into_iter()) {
-                r.push((product.clone(), allocation));
+        let ys = Array::from_vec(ys);
+        let mu = Array::from_vec(mu);
+        let sigma = rets.cov(1.0)?;
+        let sigma_inv = sigma.inv()?;
+        let diag_y = Array2::from_diag(&ys);
+        let mut x_redp = sigma_inv.dot(&mu).t().dot(&sigma_inv).dot(&diag_y).to_vec();
+        if short_sales_constraint {
+            x_redp = x_redp.iter().map(|&x| x.max(0.0)).collect();
+        };
+
+        let x_redp_sum_abs = x_redp.iter().map(|x| x.abs()).sum::<f64>();
+        let x_redp_normalized = x_redp.iter().map(|x| x / x_redp_sum_abs);
+        let mut r: Vec<(Product, f64)> = Vec::new();
+        for ((p, _), allocation) in self.0.iter().zip(x_redp_normalized) {
+            if short_sales_constraint {
+                if allocation > 0.0 {
+                    // println!("{} allocation {}", &p.inner.name, allocation,);
+                    r.push((p.clone(), allocation));
+                }
+            } else {
+                r.push((p.clone(), allocation));
             }
-            Ok(r)
-        } else {
-            let matrix = matrix.map(|x| x / sum);
-            for (product, allocation) in self.0.iter().zip(matrix.into_iter()) {
-                r.push((product.clone(), allocation));
-            }
-            Ok(r)
         }
+        Ok(r)
     }
 }
 
 #[cfg(test)]
 mod test {
 
-    use degiro::client::ClientBuilder;
+    use degiro_rs::{
+        api::{account::AccountConfigExt, login::Authorize, product::ProductExt},
+        client::Client,
+        util::Period,
+    };
 
-    use super::{SingleAllocation, ProductsSeq};
+    use super::*;
 
     #[tokio::test]
     async fn single_allocation() {
-        let username = std::env::args().nth(2).expect("no username given");
-        let password = std::env::args().nth(3).expect("no password given");
-        let mut builder = ClientBuilder::default();
-        let client = builder
-            .username(&username)
-            .password(&password)
-            .build()
+        let client = Client::new_from_env()
+            .login()
+            .await
+            .unwrap()
+            .account_config()
+            .await
             .unwrap();
-        let product = client.product_by_id("1089390").await.unwrap();
+        let product = client.product("1089390").await.unwrap();
         let allocation = product
-            .single_allocation(0.3, 0.0, &degiro::Period::P1Y, &degiro::Period::P1M)
+            .single_allocation(RiskMode::STD, 0.3, 0.0, &Period::P1Y, &Period::P1M)
             .await
             .unwrap();
         dbg!(product, allocation);
     }
-    #[tokio::test]
-    async fn multiple_allocation() {
-        let username = std::env::args().nth(2).expect("no username given");
-        let password = std::env::args().nth(3).expect("no password given");
-        let mut builder = ClientBuilder::default();
-        let client = builder
-            .username(&username)
-            .password(&password)
-            .build()
-            .unwrap();
-        let p1 = client.product_by_id("1089390").await.unwrap();
-        let p2 = client.product_by_id("332111").await.unwrap();
-        let pxs = ProductsSeq(vec![p1, p2]);
-        let x = pxs.redp_multiple_allocation(0.3, 0.0, &degiro::Period::P1Y, &degiro::Period::P1M).await.unwrap();
-        dbg!(x);
-    }
+    // TODO:
+    // #[tokio::test]
+    // async fn multiple_allocation() {
+    //     let username = std::env::args().nth(2).expect("no username given");
+    //     let password = std::env::args().nth(3).expect("no password given");
+    //     let mut builder = ClientBuilder::default();
+    //     let client = builder
+    //         .username(&username)
+    //         .password(&password)
+    //         .build()
+    //         .unwrap()
+    //         .login()
+    //         .await
+    //         .unwrap()
+    //         .account_config()
+    //         .await
+    //         .unwrap();
+    //     let p1 = client.product("1089390").await.unwrap();
+    //     let p2 = client.product("332111").await.unwrap();
+    //     let pxs = ValorSeq(vec![p1, p2]);
+    //     let x = pxs
+    //         .redp_multiple_allocation(0.3, 0.0, &Period::P1Y, &Period::P1M)
+    //         .await
+    //         .unwrap();
+    //     dbg!(x);
+    // }
 }
