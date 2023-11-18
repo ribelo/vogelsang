@@ -16,7 +16,6 @@
           };
 
           native_libs = with pkgs; [
-            gfortran
             pkg-config
             openssl
           ];

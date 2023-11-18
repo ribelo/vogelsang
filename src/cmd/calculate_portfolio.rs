@@ -95,78 +95,74 @@ impl App<degiro_rs::client::client_status::Authorized> {
         short_sales_constraint: bool,
     ) -> PortfolioCalculator {
         let data = Arc::new(DashMap::new());
-        let tasks: Vec<_> = self
-            .settings
-            .assets
-            .iter()
-            .map(|(id, _)| {
-                let id = id.clone();
-                let stocks = Arc::clone(&data);
-                let candles_handler = self.candles_handler(&id);
-                let product_handler = self.product_handler(&id);
-                tokio::spawn(async move {
-                    let candles = candles_handler.take().await;
-                    let product = product_handler.take().await;
-                    match (candles, product) {
-                        (Ok(candles), Ok(product)) => {
-                            if candles.time.len() >= freq as usize {
-                                let candles = candles.take_last(freq as usize).unwrap();
-                                let single_allocation = candles
-                                    .single_allocation(
-                                        RiskMode::STD,
-                                        risk,
-                                        risk_free,
-                                        &Period::P1Y,
-                                        &Period::P1M,
-                                    )
-                                    .await
-                                    .unwrap();
-                                let sharpe_ratio = *candles
-                                    .sharpe_ratio(freq as usize, risk_free)
-                                    .unwrap()
-                                    .last()
-                                    .unwrap();
-                                let avg_dd = *candles
-                                    .average_drawdown(freq as usize)
-                                    .unwrap()
-                                    .last()
-                                    .unwrap();
-                                let rsi = *candles.rsi(freq as usize).unwrap().last().unwrap();
-                                let redp = *candles
-                                    .rolling_economic_drawndown(freq as usize)
-                                    .unwrap()
-                                    .last()
-                                    .unwrap();
-                                let entry = DataEntry {
-                                    product,
-                                    candles,
-                                    single_allocation,
-                                    redp_allocation: 0.0,
-                                    sharpe_ratio,
-                                    avg_dd,
-                                    rsi,
-                                    redp,
-                                };
-                                stocks.insert(id, entry);
-                            } else {
-                                println!("Not enough data for {}", &id);
-                            }
-                        }
-                        (Ok(_), Err(_)) => {
-                            println!("Cannot fetch product data for {}", &id);
-                        }
-                        (Err(_), Ok(_)) => {
-                            println!("Cannot fetch candles data for {}", &id);
-                        }
-                        (Err(_), Err(_)) => {
-                            println!("Cannot fetch candles and product data for {}", &id);
+        let mut set = tokio::task::JoinSet::new();
+        for (id, _) in self.settings.assets.iter() {
+            let id = id.clone();
+            let stocks = Arc::clone(&data);
+            let candles_handler = self.candles_handler(&id);
+            let product_handler = self.product_handler(&id);
+            set.spawn(async move {
+                let candles = candles_handler.take().await;
+                let product = product_handler.take().await;
+                match (candles, product) {
+                    (Ok(candles), Ok(product)) => {
+                        if candles.time.len() >= freq as usize {
+                            let candles = candles.take_last(freq as usize).unwrap();
+                            let single_allocation = candles
+                                .single_allocation(
+                                    RiskMode::STD,
+                                    risk,
+                                    risk_free,
+                                    &Period::P1Y,
+                                    &Period::P1M,
+                                )
+                                .await
+                                .unwrap();
+                            let sharpe_ratio = *candles
+                                .sharpe_ratio(freq as usize, risk_free)
+                                .unwrap()
+                                .last()
+                                .unwrap();
+                            let avg_dd = *candles
+                                .average_drawdown(freq as usize)
+                                .unwrap()
+                                .last()
+                                .unwrap();
+                            let rsi = *candles.rsi(freq as usize).unwrap().last().unwrap();
+                            let redp = *candles
+                                .rolling_economic_drawndown(freq as usize)
+                                .unwrap()
+                                .last()
+                                .unwrap();
+                            let entry = DataEntry {
+                                product,
+                                candles,
+                                single_allocation,
+                                redp_allocation: 0.0,
+                                sharpe_ratio,
+                                avg_dd,
+                                rsi,
+                                redp,
+                            };
+                            stocks.insert(id, entry);
+                        } else {
+                            println!("Not enough data for {}", &id);
                         }
                     }
-                })
-            })
-            .collect();
+                    (Ok(_), Err(_)) => {
+                        println!("Cannot fetch product data for {}", &id);
+                    }
+                    (Err(_), Ok(_)) => {
+                        println!("Cannot fetch candles data for {}", &id);
+                    }
+                    (Err(_), Err(_)) => {
+                        println!("Cannot fetch candles and product data for {}", &id);
+                    }
+                }
+            });
+        }
 
-        futures::future::join_all(tasks).await;
+        while (set.join_next().await).is_some() {}
         PortfolioCalculator {
             mode,
             freq,
@@ -275,6 +271,7 @@ impl PortfolioCalculator {
                     } = entry.value();
                     (product.clone(), candles.clone())
                 })
+                .sorted_by_cached_key(|(p, _c)| p.inner.id.clone())
                 .collect_vec();
 
             let seq = AssetsSeq(stocks);

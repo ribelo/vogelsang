@@ -6,9 +6,7 @@ use degiro_rs::{
 };
 use erfurt::candle::Candles;
 use erfurt::prelude::*;
-use ndarray::{Array, Array2};
-use ndarray_linalg::Inverse;
-use ndarray_stats::CorrelationExt;
+use nalgebra as na;
 use qualsdorf::prelude::*;
 use qualsdorf::{
     rolling_economic_drawdown::RollingEconomicDrawdownExt, sharpe_ratio::SharpeRatioExt, Indicator,
@@ -16,6 +14,7 @@ use qualsdorf::{
 };
 use statrs::statistics::Statistics;
 use strum::EnumString;
+use tap::Tap;
 
 #[derive(Debug)]
 pub struct LSV {
@@ -186,6 +185,41 @@ impl From<Vec<(Product, Candles)>> for AssetsSeq {
     }
 }
 
+fn na_covariance(matrix: &na::DMatrix<f64>) -> na::DMatrix<f64> {
+    println!("Input matrix shape: {:?}", matrix.shape());
+    let nrows = matrix.nrows(); // Number of instruments
+    let ncols = matrix.ncols(); // Number of observations
+
+    // The covariance matrix should be a square matrix with dimensions equal to the number of instruments
+    let mut covariance_matrix = na::DMatrix::zeros(nrows, nrows);
+    println!(
+        "Covariance matrix dimensions: {:?}",
+        covariance_matrix.shape()
+    );
+
+    let means = matrix.row_mean(); // Using row_mean for mean of each feature
+
+    // Compute the covariance matrix
+    for i in 0..nrows {
+        for j in i..nrows {
+            let mut sum = 0.0;
+
+            // Compute the sum of products of deviations from the mean
+            for k in 0..ncols {
+                sum += (matrix[(i, k)] - means[k]) * (matrix[(j, k)] - means[k]);
+            }
+
+            let cov = sum / (ncols as f64 - 1.0); // Use ncols here as it's the number of observations
+            covariance_matrix[(i, j)] = cov;
+            if i != j {
+                covariance_matrix[(j, i)] = cov; // Covariance is symmetric
+            }
+        }
+    }
+
+    covariance_matrix
+}
+
 impl AssetsSeq {
     pub async fn redp_multiple_allocation(
         &self,
@@ -197,14 +231,17 @@ impl AssetsSeq {
         short_sales_constraint: bool,
     ) -> Result<Vec<(Product, f64)>> {
         let freq = period.div(interval);
-        let mut rets = Array2::<f64>::zeros((0, freq));
+        let mut rets_rows = Vec::new();
+
         let mut ys = Vec::new();
         let mut mu = Vec::new();
         for (_p, candles) in self.0.clone() {
+            println!("id: {}", &_p.inner.id);
             let ret = candles
                 .ret()
                 .ok_or_else(|| anyhow!("can't calculate return"))?;
-            rets.push_row(Array::from_vec(ret.clone()).view())?;
+            let row = na::RowDVector::from_vec(ret.clone());
+            rets_rows.push(row);
             let risk_metric = match mode {
                 RiskMode::STD => ret.clone().std_dev(),
                 RiskMode::LSV => candles
@@ -229,12 +266,24 @@ impl AssetsSeq {
             ys.push(y);
             mu.push(drift);
         }
-        let ys = Array::from_vec(ys);
-        let mu = Array::from_vec(mu);
-        let sigma = rets.cov(1.0)?;
-        let sigma_inv = sigma.inv()?;
-        let diag_y = Array2::from_diag(&ys);
-        let mut x_redp = sigma_inv.dot(&mu).t().dot(&sigma_inv).dot(&diag_y).to_vec();
+        let rets = na::DMatrix::from_rows(&rets_rows)
+            .tap(|x| println!("rets dimensions: {:?} {}", x.shape(), x.as_slice().len()));
+        let ys = na::DVector::<f64>::from_vec(ys);
+        let mu =
+            na::DVector::<f64>::from_vec(mu).tap(|x| println!("mu dimensions: {:?}", x.shape()));
+        let sigma = na_covariance(&rets).tap(|x| println!("sigma dimensions: {:?}", x.shape()));
+        if !sigma.is_invertible() {
+            return Err(anyhow!("Covariance matrix is not invertible"));
+        };
+        let Some(sigma_inv) = sigma.try_inverse() else {
+            return Err(anyhow!("Can't invert covariance matrix"));
+        };
+        let diag_y = na::DMatrix::<f64>::from_diagonal(&ys)
+            .tap(|x| println!("diag-Y dimensions: {:?}", x.shape()));
+
+        let mut x_redp = ((&sigma_inv * &mu).transpose() * &sigma_inv * &diag_y)
+            .as_slice()
+            .to_vec();
         if short_sales_constraint {
             x_redp = x_redp.iter().map(|&x| x.max(0.0)).collect();
         };
