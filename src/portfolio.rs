@@ -11,6 +11,7 @@ use qualsdorf::{
     rolling_economic_drawdown::RollingEconomicDrawdownExt, sharpe_ratio::SharpeRatioExt, Indicator,
     ReturnExt,
 };
+use serde::{Deserialize, Serialize};
 use statrs::statistics::Statistics;
 use strum::EnumString;
 use tap::Tap;
@@ -80,7 +81,7 @@ pub trait LsvExt: ReturnExt {
 
 impl<T> LsvExt for T where T: CandlesExt {}
 
-#[derive(Debug, Clone, EnumString)]
+#[derive(Debug, Clone, Copy, EnumString, Serialize, Deserialize)]
 pub enum RiskMode {
     STD,
     LSV,
@@ -93,20 +94,20 @@ pub trait SingleAllocation {
         mode: RiskMode,
         risk: f64,
         risk_free: f64,
-        period: &Period,
-        interval: &Period,
+        period: Period,
+        interval: Period,
     ) -> Result<f64>;
 }
 
 #[async_trait]
-impl SingleAllocation for Product {
+impl<'a> SingleAllocation for Product {
     async fn single_allocation(
         &self,
         mode: RiskMode,
         risk: f64,
         risk_free: f64,
-        period: &Period,
-        interval: &Period,
+        period: Period,
+        interval: Period,
     ) -> Result<f64> {
         let candles: Candles = self.quotes(period, interval).await?.into();
         candles
@@ -122,8 +123,8 @@ impl SingleAllocation for Quotes {
         mode: RiskMode,
         risk: f64,
         risk_free: f64,
-        period: &Period,
-        interval: &Period,
+        period: Period,
+        interval: Period,
     ) -> Result<f64> {
         Into::<Candles>::into(self)
             .single_allocation(mode, risk, risk_free, period, interval)
@@ -138,8 +139,8 @@ impl SingleAllocation for Candles {
         mode: RiskMode,
         risk: f64,
         risk_free: f64,
-        period: &Period,
-        interval: &Period,
+        period: Period,
+        interval: Period,
     ) -> Result<f64> {
         let freq = period.div(interval);
         let risk_metric = match mode {
@@ -168,10 +169,10 @@ impl SingleAllocation for Candles {
             .last()
             .ok_or_else(|| anyhow!("can't get value"))?
             .to_owned();
-        let allocation = 1.0_f64.min(0.0_f64.max(
-            dbg!(((sr / risk_metric) + 0.5) / (1.0 - risk.powf(2.0)))
-                * dbg!(dbg!(risk - redp) / (1.0 - redp)),
-        ));
+        let allocation =
+            1.0_f64.min(0.0_f64.max(
+                ((sr / risk_metric) + 0.5 / (1.0 - risk.powf(2.0))) * risk - redp / (1.0 - redp),
+            ));
         Ok(allocation)
     }
 }
@@ -225,8 +226,8 @@ impl AssetsSeq {
         mode: RiskMode,
         risk: f64,
         risk_free: f64,
-        period: &Period,
-        interval: &Period,
+        period: Period,
+        interval: Period,
         short_sales_constraint: bool,
     ) -> Result<Vec<(Product, f64)>> {
         let freq = period.div(interval);
@@ -307,26 +308,18 @@ impl AssetsSeq {
 #[cfg(test)]
 mod test {
 
-    use degiro_rs::{
-        api::{account::AccountConfigExt, login::Authorize, product::ProductExt},
-        client::Client,
-        util::Period,
-    };
+    use degiro_rs::{client::Client, util::Period};
 
     use super::*;
 
     #[tokio::test]
     async fn single_allocation() {
-        let client = Client::new_from_env()
-            .login()
-            .await
-            .unwrap()
-            .account_config()
-            .await
-            .unwrap();
+        let client = Client::new_from_env();
+        client.login().await.unwrap();
+        client.account_config().await.unwrap();
         let product = client.product("1089390").await.unwrap();
         let allocation = product
-            .single_allocation(RiskMode::STD, 0.3, 0.0, &Period::P1Y, &Period::P1M)
+            .single_allocation(RiskMode::STD, 0.3, 0.0, Period::P1Y, Period::P1M)
             .await
             .unwrap();
         dbg!(product, allocation);

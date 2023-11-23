@@ -1,52 +1,66 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
-use comfy_table::{presets::UTF8_BORDERS_ONLY, Table};
-use degiro_rs::{
-    api::{account::AccountConfigExt, login::Authorize},
-    client::client_status::{Authorized, Unauthorized},
-    prelude::*,
-    util::{Period, ProductCategory},
-};
-use qualsdorf::{
-    average_drawdown::{self, AverageDrawdownExt},
-    std::StdExt,
-};
-use strum::EnumString;
+use anyhow::Result;
+use async_trait::async_trait;
+use clap::{ArgGroup, Parser, Subcommand};
+use degiro_rs::util::ProductCategory;
+use eventual::eve::Eve;
+use tokio::signal;
+use tracing::{error, warn};
 
 use crate::{
-    data::candles::CandlesHandler,
-    portfolio::{RiskMode, SingleAllocation},
-    prelude::*,
-    tcp::{self, ClientBuilder},
+    data::products::ProductQuery,
+    portfolio::RiskMode,
+    server::{self, ClientBuilder, Response},
     App,
 };
 
 #[derive(Debug, Parser)]
 pub struct Cli {
+    #[clap(short, long, default_value = "9123")]
+    port: u16,
     #[clap(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    Test,
-    Config,
+    Login {},
     FetchData {
         id: Option<String>,
     },
-    GetData {
-        id: String,
+    #[clap(group(ArgGroup::new("product_query").required(true).args(&["id", "symbol", "name"])))]
+    GetProduct {
+        #[clap(long, group = "product_query")]
+        id: Option<String>,
+        #[clap(long, group = "product_query")]
+        symbol: Option<String>,
+        #[clap(long, group = "product_query")]
+        name: Option<String>,
+    },
+    #[clap(group(ArgGroup::new("product_query").required(true).args(&["id", "symbol", "name"])))]
+    GetCandles {
+        #[clap(long, group = "product_query")]
+        id: Option<String>,
+        #[clap(long, group = "product_query")]
+        symbol: Option<String>,
+        #[clap(long, group = "product_query")]
+        name: Option<String>,
     },
     GetPortfolio,
-    SingleAllocation {
-        id: String,
-        #[clap(long)]
+    #[clap(group(ArgGroup::new("product_query").required(true).args(&["id", "symbol", "name"])))]
+    GetSingleAllocation {
+        #[clap(long, group = "product_query")]
+        id: Option<String>,
+        #[clap(long, group = "product_query")]
+        symbol: Option<String>,
+        #[clap(long, group = "product_query")]
+        name: Option<String>,
+        #[clap(long, default_value = "STD")]
         mode: RiskMode,
         #[clap(long)]
         risk: f64,
-        #[clap(long)]
+        #[clap(long, default_value = "0.0")]
         risk_free: f64,
     },
     CalculatePortfolio {
@@ -54,7 +68,7 @@ pub enum Commands {
         mode: RiskMode,
         #[clap(long)]
         risk: f64,
-        #[clap(long)]
+        #[clap(long, default_value = "0.0")]
         risk_free: f64,
         #[clap(long)]
         freq: u32,
@@ -77,151 +91,157 @@ pub enum Commands {
         #[clap(short, default_value = "3")]
         n: u32,
     },
-    Server {
-        #[clap(short, long, default_value = "9123")]
-        port: u16,
-    },
-    Send {
-        #[clap(short, long, default_value = "9123")]
-        port: u16,
-    },
 }
 
-impl App<Unauthorized> {
-    pub async fn authorize(self) -> Result<App<Authorized>> {
-        let client = self.degiro.login().await?.account_config().await?;
-        let app = App {
-            settings: self.settings,
-            degiro: client,
-        };
-        Ok(app)
+impl App {
+    pub async fn authorize(&self) -> Result<()> {
+        self.degiro.login().await?;
+        self.degiro.account_config().await?;
+        Ok(())
     }
 }
 
-impl App<Unauthorized> {
-    pub async fn run(self) -> Result<()> {
+#[async_trait]
+pub trait CliExt {
+    async fn run(self) -> Result<()>;
+}
+
+#[async_trait]
+impl CliExt for Eve<App> {
+    async fn run(self) -> Result<()> {
         let cli = Cli::parse();
+        let port = cli.port;
         match cli.command {
-            Commands::Test => {
-                // 332111 - msft
-                let app = self.authorize().await?;
-                let quotes = app
-                    .degiro
-                    .quotes("332111", &Period::P50Y, &Period::P1M)
-                    .await
-                    .unwrap();
-                dbg!(quotes);
-            }
-            Commands::Config => todo!(),
-            Commands::FetchData { id } => {
-                let app = self.authorize().await?;
-                if let Some(id) = id {
-                    println!("Fetching data for {}", &id);
-                    app.candles_handler(&id).download().await?;
-                    app.product_handler(&id).download().await?;
-                } else {
-                    for (id, name) in app.settings.assets.iter() {
-                        // Align ID to 10 characters to the right. rust
-                        println!("Fetching data for {:>10} - {}", id, name);
-                        if app.candles_handler(id).download().await.is_err() {
-                            println!("Failed to fetch candles data for {:>10} - {}", &id, &name);
-                        };
-                        if app.product_handler(id).download().await.is_err() {
-                            println!("Failed to fetch product data for {:>10} - {}", &id, &name);
-                        };
-                    }
-                }
-            }
-            Commands::GetData { id } => {
-                let app = self.authorize().await?;
-                let product = app.product_handler(&id).take().await?;
-                dbg!(product);
-            }
-            Commands::SingleAllocation {
-                id,
-                mode,
-                risk,
-                risk_free,
-            } => {
-                let app = self.authorize().await?;
-                let product = app.product_handler(&id).take().await?;
-                let candles = app.candles_handler(&id).take().await?;
-                let allocation = candles
-                    .single_allocation(mode, risk, risk_free, &Period::P1Y, &Period::P1M)
-                    .await?;
-                println!("{} - {} : {}", id, product.inner.name, allocation)
-            }
-            Commands::GetPortfolio => {
-                let app = self.authorize().await?;
-                let portfolio = app.portfolio().await?;
-                dbg!(portfolio.cash().value());
-            }
-            Commands::RecalculateSl { n } => {
-                let app = self.authorize().await?;
-                let portfolio = app.portfolio().await?.current().products();
-                let mut table = comfy_table::Table::new();
-                let header = vec![
-                    comfy_table::Cell::new("id"),
-                    comfy_table::Cell::new("name"),
-                    comfy_table::Cell::new("symbol"),
-                    comfy_table::Cell::new("date"),
-                    comfy_table::Cell::new("price"),
-                    comfy_table::Cell::new("avg dd")
-                        .set_alignment(comfy_table::CellAlignment::Right),
-                    comfy_table::Cell::new("stop loss")
-                        .set_alignment(comfy_table::CellAlignment::Right),
-                ];
-                table.set_header(header);
-                table.load_preset(UTF8_BORDERS_ONLY);
-                for position in portfolio.0.iter() {
-                    let product = app.product_handler(&position.inner.id).take().await;
-                    let candles = app.candles_handler(&position.inner.id).take().await;
-                    if let (Ok(product), Ok(candles)) = (product, candles) {
-                        if let Some(avg_dd) = candles.average_drawdown(12) {
-                            if let Some(Some(avg_dd_value)) = avg_dd.values.last() {
-                                let last_price = candles.open.last().unwrap();
-                                let stop_loss = last_price * (1.0 - avg_dd_value * n as f64);
-                                table.add_row(vec![
-                                    comfy_table::Cell::new(product.inner.id.clone()),
-                                    comfy_table::Cell::new(format!(
-                                        "{:<24}",
-                                        product.inner.name.chars().take(24).collect::<String>()
-                                    )),
-                                    comfy_table::Cell::new(product.inner.symbol.clone()),
-                                    comfy_table::Cell::new(
-                                        candles.time.last().unwrap().to_string(),
-                                    ),
-                                    comfy_table::Cell::new(last_price)
-                                        .set_alignment(comfy_table::CellAlignment::Right),
-                                    comfy_table::Cell::new(format!("{:.2}", avg_dd_value))
-                                        .set_alignment(comfy_table::CellAlignment::Right),
-                                    comfy_table::Cell::new(format!("{:.2}", stop_loss))
-                                        .set_alignment(comfy_table::CellAlignment::Right),
-                                ]);
-                            }
+            Some(cmd) => {
+                let addr = Ipv4Addr::new(127, 0, 0, 1);
+                let socket = SocketAddrV4::new(addr, port);
+                let mut client = ClientBuilder::new(socket).build().await.unwrap();
+                match cmd {
+                    Commands::Login {} => {
+                        let msg = server::Request::Login {};
+                        if let Some(msg) = client.write(msg).await {
+                            dbg!(msg);
                         }
-                    } else {
-                        eprintln!("Failed to get data for {}", &position.inner.id);
-                    };
-                }
-                print!("{}", table);
-            }
-            Commands::CalculatePortfolio {
-                mode,
-                risk,
-                risk_free,
-                freq,
-                money,
-                max_stocks,
-                min_rsi,
-                max_rsi,
-                min_class,
-                max_class,
-                short_sales_constraint,
-            } => {
-                let app = self.authorize().await?;
-                let mut calculator = app
-                    .portfolio_calculator(
+                    }
+                    Commands::FetchData { id } => {
+                        let msg = server::Request::FetchData { id };
+                        if let Some(msg) = client.write(msg).await {
+                            dbg!(msg);
+                        }
+                    }
+                    Commands::GetProduct { id, symbol, name } => {
+                        let query = if let Some(id) = id {
+                            ProductQuery::Id(id.clone())
+                        } else if let Some(symbol) = symbol {
+                            ProductQuery::Symbol(symbol.clone())
+                        } else if let Some(name) = name {
+                            ProductQuery::Name(name.clone())
+                        } else {
+                            panic!("No valid argument provided for GetProduct");
+                        };
+                        let msg = server::Request::GetProduct { query };
+                        if let Some(msg) = client.write(msg).await {
+                            dbg!(msg);
+                        }
+                    }
+                    Commands::GetCandles { id, symbol, name } => {
+                        let query = if let Some(id) = id {
+                            ProductQuery::Id(id.clone())
+                        } else if let Some(symbol) = symbol {
+                            ProductQuery::Symbol(symbol.clone())
+                        } else if let Some(name) = name {
+                            ProductQuery::Name(name.clone())
+                        } else {
+                            panic!("No valid argument provided for GetProduct");
+                        };
+                        let msg = server::Request::GetCandles { query };
+                        if let Some(msg) = client.write(msg).await {
+                            dbg!(msg);
+                        }
+                    }
+                    Commands::GetSingleAllocation {
+                        id,
+                        mode,
+                        risk,
+                        risk_free,
+                        symbol,
+                        name,
+                    } => {
+                        let query = if let Some(id) = id {
+                            ProductQuery::Id(id.clone())
+                        } else if let Some(symbol) = symbol {
+                            ProductQuery::Symbol(symbol.clone())
+                        } else if let Some(name) = name {
+                            ProductQuery::Name(name.clone())
+                        } else {
+                            panic!("No valid argument provided for GetProduct");
+                        };
+                        let msg = server::Request::GetSingleAllocation {
+                            query,
+                            mode,
+                            risk,
+                            risk_free,
+                        };
+                        if let Some(msg) = client.write(msg).await {
+                            dbg!(msg);
+                        }
+                    }
+                    Commands::GetPortfolio => {
+                        // let app = self.state.authorize().await?;
+                        // let portfolio = app.portfolio().await?;
+                        // dbg!(portfolio.cash().value());
+                    }
+                    Commands::RecalculateSl { n } => {
+                        // let app = self.state.authorize().await?;
+                        // let portfolio = app.portfolio().await?.current().products();
+                        // let mut table = comfy_table::Table::new();
+                        // let header = vec![
+                        //     comfy_table::Cell::new("id"),
+                        //     comfy_table::Cell::new("name"),
+                        //     comfy_table::Cell::new("symbol"),
+                        //     comfy_table::Cell::new("date"),
+                        //     comfy_table::Cell::new("price"),
+                        //     comfy_table::Cell::new("avg dd")
+                        //         .set_alignment(comfy_table::CellAlignment::Right),
+                        //     comfy_table::Cell::new("stop loss")
+                        //         .set_alignment(comfy_table::CellAlignment::Right),
+                        // ];
+                        // table.set_header(header);
+                        // table.load_preset(UTF8_BORDERS_ONLY);
+                        // for position in portfolio.0.iter() {
+                        //     let product = app.product_handler(&position.inner.id).take().await;
+                        //     let candles = app.candles_handler(&position.inner.id).take().await;
+                        //     if let (Ok(product), Ok(candles)) = (product, candles) {
+                        //         if let Some(avg_dd) = candles.average_drawdown(12) {
+                        //             if let Some(Some(avg_dd_value)) = avg_dd.values.last() {
+                        //                 let last_price = candles.open.last().unwrap();
+                        //                 let stop_loss = last_price * (1.0 - avg_dd_value * n as f64);
+                        //                 table.add_row(vec![
+                        //                     comfy_table::Cell::new(product.inner.id.clone()),
+                        //                     comfy_table::Cell::new(format!(
+                        //                         "{:<24}",
+                        //                         product.inner.name.chars().take(24).collect::<String>()
+                        //                     )),
+                        //                     comfy_table::Cell::new(product.inner.symbol.clone()),
+                        //                     comfy_table::Cell::new(
+                        //                         candles.time.last().unwrap().to_string(),
+                        //                     ),
+                        //                     comfy_table::Cell::new(last_price)
+                        //                         .set_alignment(comfy_table::CellAlignment::Right),
+                        //                     comfy_table::Cell::new(format!("{:.2}", avg_dd_value))
+                        //                         .set_alignment(comfy_table::CellAlignment::Right),
+                        //                     comfy_table::Cell::new(format!("{:.2}", stop_loss))
+                        //                         .set_alignment(comfy_table::CellAlignment::Right),
+                        //                 ]);
+                        //             }
+                        //         }
+                        //     } else {
+                        //         eprintln!("Failed to get data for {}", &position.inner.id);
+                        //     };
+                        // }
+                        // print!("{}", table);
+                    }
+                    Commands::CalculatePortfolio {
                         mode,
                         risk,
                         risk_free,
@@ -233,26 +253,46 @@ impl App<Unauthorized> {
                         min_class,
                         max_class,
                         short_sales_constraint,
-                    )
-                    .await;
-                calculator.remove_invalid().calculate().await;
-                print!("{}", calculator.as_table());
+                    } => {
+                        let req = server::Request::CalculatePortfolio {
+                            mode,
+                            risk,
+                            risk_free,
+                            freq,
+                            money,
+                            max_stocks,
+                            min_rsi,
+                            max_rsi,
+                            min_class,
+                            max_class,
+                            short_sales_constraint,
+                        };
+                        match client.write(req).await {
+                            Some(Response::SendPortfolio { portfolio }) => {
+                                if let Some(portfolio) = portfolio {
+                                    println!("{}", portfolio);
+                                } else {
+                                    println!("No portfolio calculated");
+                                }
+                            }
+                            Some(_) => error!("Unexpected response"),
+                            None => warn!("No response"),
+                        }
+                    }
+                }
             }
-            Commands::Server { port } => {
+            None => {
                 let addr = Ipv4Addr::new(127, 0, 0, 1);
                 let socket = SocketAddrV4::new(addr, port);
-                let app = self.clone().authorize().await?;
-                match tcp::Server::new(socket, app).await {
+                match server::Server::new(socket, self.clone()).await {
                     Ok(mut server) => server.run().await,
                     Err(err) => println!("{err}"),
                 }
-            }
-            Commands::Send { port } => {
-                let addr = Ipv4Addr::new(127, 0, 0, 1);
-                let socket = SocketAddrV4::new(addr, port);
-                let mut client = ClientBuilder::new(socket).build().await.unwrap();
-                if let Some(msg) = client.write(tcp::Msg::Ping).await {
-                    dbg!(msg);
+
+                tokio::select! {
+                    _ = signal::ctrl_c() => {
+                        println!("Ctrl-C received, shutting down");
+                    },
                 }
             }
         };

@@ -1,19 +1,12 @@
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bincode;
 
-use degiro_rs::{
-    api::{
-        portfolio::Position,
-        quotes::{Quotes, QuotesExt},
-    },
-    client::{client_status::Authorized, Client},
-    util::Period,
-};
-use erfurt::candle::{Candle, Candles};
+use degiro_rs::{client::Client, util::Period};
+use erfurt::candle::Candles;
 use thiserror::Error;
-use tokio::{fs::File, io::AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::App;
 
@@ -23,7 +16,7 @@ use super::{DataHandler, DataHandlerError};
 pub struct CandlesHandlerBuilder {
     id: Option<String>,
     interval: Option<Period>,
-    degiro: Option<Client<Authorized>>,
+    degiro: Option<Client>,
     data_path: Option<String>,
 }
 
@@ -50,7 +43,7 @@ impl CandlesHandlerBuilder {
         self
     }
 
-    pub fn degiro(mut self, degiro: Client<Authorized>) -> CandlesHandlerBuilder {
+    pub fn degiro(mut self, degiro: Client) -> CandlesHandlerBuilder {
         self.degiro = Some(degiro);
         self
     }
@@ -83,20 +76,15 @@ impl CandlesHandlerBuilder {
 pub struct CandlesHandler {
     pub id: String,
     pub interval: Period,
-    degiro: Client<Authorized>,
+    degiro: Client,
     candles: Option<Candles>,
     path: String,
 }
 
-impl CandlesHandler {
-    pub fn new(
-        id: String,
-        interval: Period,
-        degiro: Client<Authorized>,
-        data_path: String,
-    ) -> CandlesHandler {
+impl<'a> CandlesHandler {
+    pub fn new(id: String, interval: Period, degiro: Client, data_path: String) -> CandlesHandler {
         CandlesHandler {
-            path: format!("{}/candles_{}_{}.bin", &data_path, &id, &interval),
+            path: format!("{}/candles_{}_{}.json", &data_path, &id, &interval),
             id,
             interval,
             degiro,
@@ -112,7 +100,7 @@ impl DataHandler for CandlesHandler {
     async fn fetch(&mut self) -> Result<&Self, DataHandlerError> {
         let candles: Candles = self
             .degiro
-            .quotes(&self.id, &Period::P50Y, &self.interval)
+            .quotes(&self.id, Period::P50Y, self.interval)
             .await?
             .into();
         self.candles.replace(candles);
@@ -127,10 +115,14 @@ impl DataHandler for CandlesHandler {
         }
         let data = self.candles.as_ref().unwrap();
         let mut file = tokio::fs::File::create(&self.path).await?;
-        let bin = bincode::serialize(data)?;
-        file.write_all(&bin).await?;
-
-        Ok(())
+        match serde_json::to_string(data) {
+            Ok(bytes) => Ok(file.write_all(&bytes.into_bytes()).await?),
+            Err(err) => Err(DataHandlerError::SerializeError(err.to_string())),
+        }
+        // match bincode::serialize(data) {
+        //     Ok(bytes) => Ok(file.write_all(&bytes).await?),
+        //     Err(err) => Err(DataHandlerError::SerializeError(err.to_string())),
+        // }
     }
 
     async fn download(&mut self) -> Result<&mut Self, DataHandlerError> {
@@ -142,10 +134,17 @@ impl DataHandler for CandlesHandler {
 
     async fn read(&mut self) -> Result<&mut Self, DataHandlerError> {
         let bytes = tokio::fs::read(&self.path).await?;
-        let candles: Candles = bincode::deserialize(&bytes)?;
-        self.candles = Some(candles);
+        match serde_json::from_slice::<Candles>(&bytes) {
+            Ok(candles) => {
+                self.candles = Some(candles);
 
-        Ok(self)
+                Ok(self)
+            }
+            Err(err) => {
+                println!("{:#?}", err);
+                Err(DataHandlerError::DeserializeError(err.to_string()))
+            }
+        }
     }
 
     async fn get(&mut self) -> Result<&Candles, DataHandlerError> {
@@ -163,7 +162,7 @@ impl DataHandler for CandlesHandler {
     }
 }
 
-impl App<Authorized> {
+impl App {
     pub fn candles_handler(&self, id: impl ToString) -> CandlesHandler {
         CandlesHandler::new(
             id.to_string(),
@@ -171,5 +170,19 @@ impl App<Authorized> {
             self.degiro.clone(),
             self.settings.data_path.clone(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::data::DataHandler;
+
+    #[tokio::test]
+    async fn candles_handler_test() {
+        let app = crate::App::new();
+        let mut handler = app.candles_handler("1157690");
+        handler.read().await.unwrap();
+        let product = handler.get().await.unwrap();
+        println!("{:#?}", product);
     }
 }

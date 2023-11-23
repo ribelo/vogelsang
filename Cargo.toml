@@ -13,6 +13,7 @@ members = []
 erfurt = { path = "../erfurt" }
 degiro-rs = { path = "../degiro-rs", features = ["erfurt"] }
 qualsdorf = { path = "../qualsdorf" }
+eventual = { path = "../eventual" }
 async-trait = "0.1.57"
 statrs = "0.16.0"
 tokio = { version = "1.21.1", features = ["full"] }
@@ -37,3 +38,7 @@ nalgebra-mvn = "0.14.0"
 tap = "1.0.1"
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.10", features = ["codec"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+atomic-take = "1.1.0"
+regex = "1.10.2"

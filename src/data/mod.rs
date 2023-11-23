@@ -6,6 +6,8 @@ pub mod products;
 
 #[derive(Debug, Error)]
 pub enum DataHandlerError {
+    #[error("Unauthorized")]
+    Unauthorized,
     #[error("Failed to fetch the required data: {0}")]
     FetchError(String),
     #[error("Failed to save the data: {0}")]
@@ -16,6 +18,10 @@ pub enum DataHandlerError {
     ReadError(String),
     #[error("Failed to get the requested output: {0}")]
     GetError(String),
+    #[error("Failed to deserialize the data: {0}")]
+    DeserializeError(String),
+    #[error("Failed to serialize the data: {0}")]
+    SerializeError(String),
 }
 
 impl From<std::io::Error> for DataHandlerError {
@@ -24,15 +30,12 @@ impl From<std::io::Error> for DataHandlerError {
     }
 }
 
-impl From<bincode::Error> for DataHandlerError {
-    fn from(e: bincode::Error) -> Self {
-        DataHandlerError::SaveError(e.to_string())
-    }
-}
-
 impl From<degiro_rs::client::ClientError> for DataHandlerError {
     fn from(e: degiro_rs::client::ClientError) -> Self {
-        DataHandlerError::FetchError(e.to_string())
+        match e {
+            degiro_rs::client::ClientError::Unauthorized => Self::Unauthorized,
+            _ => Self::FetchError(e.to_string()),
+        }
     }
 }
 

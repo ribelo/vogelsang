@@ -1,28 +1,13 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    ops::Deref,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, sync::Arc};
 
-use anyhow::Result;
 use chrono::Datelike;
-use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, CellAlignment, Color, Table};
-use dashmap::{DashMap, DashSet};
+use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, Table};
+use dashmap::DashMap;
 use degiro_rs::{
-    api::{
-        account::AccountConfigExt,
-        login::Authorize,
-        product::{Product, ProductExt},
-    },
-    client::{
-        client_status::{self, Authorized},
-        Client,
-    },
+    api::product::Product,
     util::{Period, ProductCategory, TransactionType},
 };
 use erfurt::prelude::*;
-use futures::future;
 use itertools::Itertools;
 use qualsdorf::{
     average_drawdown::AverageDrawdownExt, rolling_economic_drawdown::RollingEconomicDrawdownExt,
@@ -30,10 +15,8 @@ use qualsdorf::{
 };
 
 use crate::{
-    data::candles::{self, CandlesHandler},
+    data::DataHandler,
     portfolio::{AssetsSeq, RiskMode, SingleAllocation},
-    prelude::*,
-    settings::Settings,
     App,
 };
 
@@ -79,7 +62,7 @@ pub struct PortfolioCalculator {
     pub data: Arc<DashMap<String, DataEntry>>,
 }
 
-impl App<degiro_rs::client::client_status::Authorized> {
+impl<'a> App {
     pub async fn portfolio_calculator(
         self,
         mode: RiskMode,
@@ -113,8 +96,8 @@ impl App<degiro_rs::client::client_status::Authorized> {
                                     RiskMode::STD,
                                     risk,
                                     risk_free,
-                                    &Period::P1Y,
-                                    &Period::P1M,
+                                    Period::P1Y,
+                                    Period::P1M,
                                 )
                                 .await
                                 .unwrap();
@@ -277,11 +260,11 @@ impl PortfolioCalculator {
             let seq = AssetsSeq(stocks);
             let Ok(mut allocations) = seq
                 .redp_multiple_allocation(
-                    self.mode.clone(),
+                    self.mode,
                     self.risk,
                     self.risk_free,
-                    &Period::P1Y,
-                    &Period::P1M,
+                    Period::P1Y,
+                    Period::P1M,
                     self.short_sales_constraint,
                 )
                 .await

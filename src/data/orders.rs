@@ -1,13 +1,13 @@
 use anyhow::Result;
+use degiro_rs::prelude::Portfolio;
 
 use crate::App;
-use degiro_rs::{client::client_status::Authorized, prelude::*};
 
 pub struct OrderHandler {
     pub id: String,
 }
 
-impl App<Authorized> {
+impl App {
     pub async fn portfolio(&self) -> Result<Portfolio> {
         let portfolio = self.degiro.portfolio().await?;
 
