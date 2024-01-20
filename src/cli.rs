@@ -4,14 +4,19 @@ use anyhow::Result;
 use async_trait::async_trait;
 use clap::{ArgGroup, Parser, Subcommand};
 use degiro_rs::util::ProductCategory;
-use eventual::eve::Eve;
+use master_of_puppets::{master_of_puppets::MasterOfPuppets, puppet::PuppetBuilder};
 use tokio::signal;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{
-    data::products::ProductQuery,
     portfolio::RiskMode,
-    server::{self, ClientBuilder, Response},
+    puppet::{
+        db::{Db, ProductQuery},
+        degiro::Degiro,
+        portfolio::Calculator,
+        settings::Settings,
+    },
+    server::{self, ClientBuilder, Response, Server},
     App,
 };
 
@@ -25,7 +30,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    Login {},
+    Authorize {},
     FetchData {
         id: Option<String>,
     },
@@ -40,6 +45,15 @@ pub enum Commands {
     },
     #[clap(group(ArgGroup::new("product_query").required(true).args(&["id", "symbol", "name"])))]
     GetCandles {
+        #[clap(long, group = "product_query")]
+        id: Option<String>,
+        #[clap(long, group = "product_query")]
+        symbol: Option<String>,
+        #[clap(long, group = "product_query")]
+        name: Option<String>,
+    },
+    #[clap(group(ArgGroup::new("product_query").required(true).args(&["id", "symbol", "name"])))]
+    GetFinancials {
         #[clap(long, group = "product_query")]
         id: Option<String>,
         #[clap(long, group = "product_query")]
@@ -71,11 +85,11 @@ pub enum Commands {
         #[clap(long, default_value = "0.0")]
         risk_free: f64,
         #[clap(long)]
-        freq: u32,
+        freq: usize,
         #[clap(long)]
         money: f64,
         #[clap(long)]
-        max_stocks: i32,
+        max_stocks: usize,
         #[clap(long)]
         min_rsi: Option<f64>,
         #[clap(long)]
@@ -86,19 +100,14 @@ pub enum Commands {
         max_class: Option<ProductCategory>,
         #[clap(long)]
         short_sales_constraint: bool,
+        #[clap(long)]
+        roic_wacc_delta: Option<f64>,
     },
     RecalculateSl {
         #[clap(short, default_value = "3")]
-        n: u32,
+        n: usize,
     },
-}
-
-impl App {
-    pub async fn authorize(&self) -> Result<()> {
-        self.degiro.login().await?;
-        self.degiro.account_config().await?;
-        Ok(())
-    }
+    CleanUp,
 }
 
 #[async_trait]
@@ -107,7 +116,7 @@ pub trait CliExt {
 }
 
 #[async_trait]
-impl CliExt for Eve<App> {
+impl CliExt for App {
     async fn run(self) -> Result<()> {
         let cli = Cli::parse();
         let port = cli.port;
@@ -117,17 +126,20 @@ impl CliExt for Eve<App> {
                 let socket = SocketAddrV4::new(addr, port);
                 let mut client = ClientBuilder::new(socket).build().await.unwrap();
                 match cmd {
-                    Commands::Login {} => {
-                        let msg = server::Request::Login {};
-                        if let Some(msg) = client.write(msg).await {
-                            dbg!(msg);
-                        }
+                    Commands::Authorize {} => {
+                        info!("Authorizing...");
+                        let msg = server::Request::Authorize {};
+                        client.write(msg).await.or_else(|| {
+                            warn!("No response");
+                            None
+                        });
                     }
                     Commands::FetchData { id } => {
                         let msg = server::Request::FetchData { id };
-                        if let Some(msg) = client.write(msg).await {
-                            dbg!(msg);
-                        }
+                        client.write(msg).await.or_else(|| {
+                            warn!("No response");
+                            None
+                        });
                     }
                     Commands::GetProduct { id, symbol, name } => {
                         let query = if let Some(id) = id {
@@ -140,8 +152,38 @@ impl CliExt for Eve<App> {
                             panic!("No valid argument provided for GetProduct");
                         };
                         let msg = server::Request::GetProduct { query };
-                        if let Some(msg) = client.write(msg).await {
-                            dbg!(msg);
+                        match client.write(msg).await {
+                            Some(Response::SendProduct { product }) => {
+                                if let Some(product) = product {
+                                    println!("{}", product);
+                                } else {
+                                    println!("No product found");
+                                }
+                            }
+                            Some(res) => error!(res = ?res, "Unexpected response"),
+                            None => warn!("No response"),
+                        };
+                    }
+                    Commands::GetFinancials { id, symbol, name } => {
+                        let query = if let Some(id) = id {
+                            ProductQuery::Id(id.clone())
+                        } else if let Some(symbol) = symbol {
+                            ProductQuery::Symbol(symbol.clone())
+                        } else if let Some(name) = name {
+                            ProductQuery::Name(name.clone())
+                        } else {
+                            panic!("No valid argument provided for GetProduct");
+                        };
+                        let msg = server::Request::GetFinancials { query };
+                        match client.write(msg).await {
+                            Some(Response::SendFinancials { financials }) => {
+                                if let Some(financials) = financials {
+                                    println!("{:#?}", financials);
+                                } else {
+                                    println!("No financials found");
+                                }
+                            }
+                            _ => warn!("Unexpected response"),
                         }
                     }
                     Commands::GetCandles { id, symbol, name } => {
@@ -155,9 +197,10 @@ impl CliExt for Eve<App> {
                             panic!("No valid argument provided for GetProduct");
                         };
                         let msg = server::Request::GetCandles { query };
-                        if let Some(msg) = client.write(msg).await {
-                            dbg!(msg);
-                        }
+                        client.write(msg).await.or_else(|| {
+                            warn!("No response");
+                            None
+                        });
                     }
                     Commands::GetSingleAllocation {
                         id,
@@ -182,64 +225,36 @@ impl CliExt for Eve<App> {
                             risk,
                             risk_free,
                         };
-                        if let Some(msg) = client.write(msg).await {
-                            dbg!(msg);
-                        }
+                        client.write(msg).await.or_else(|| {
+                            warn!("No response");
+                            None
+                        });
                     }
                     Commands::GetPortfolio => {
-                        // let app = self.state.authorize().await?;
-                        // let portfolio = app.portfolio().await?;
-                        // dbg!(portfolio.cash().value());
+                        let msg = server::Request::GetPortfolio {};
+                        match client.write(msg).await {
+                            Some(Response::SendPortfolio { portfolio }) => {
+                                if let Some(portfolio) = portfolio {
+                                    println!("{}", portfolio);
+                                } else {
+                                    println!("No portfolio calculated");
+                                }
+                            }
+                            Some(_) => error!("Unexpected response"),
+                            None => warn!("No response"),
+                        }
                     }
                     Commands::RecalculateSl { n } => {
-                        // let app = self.state.authorize().await?;
-                        // let portfolio = app.portfolio().await?.current().products();
-                        // let mut table = comfy_table::Table::new();
-                        // let header = vec![
-                        //     comfy_table::Cell::new("id"),
-                        //     comfy_table::Cell::new("name"),
-                        //     comfy_table::Cell::new("symbol"),
-                        //     comfy_table::Cell::new("date"),
-                        //     comfy_table::Cell::new("price"),
-                        //     comfy_table::Cell::new("avg dd")
-                        //         .set_alignment(comfy_table::CellAlignment::Right),
-                        //     comfy_table::Cell::new("stop loss")
-                        //         .set_alignment(comfy_table::CellAlignment::Right),
-                        // ];
-                        // table.set_header(header);
-                        // table.load_preset(UTF8_BORDERS_ONLY);
-                        // for position in portfolio.0.iter() {
-                        //     let product = app.product_handler(&position.inner.id).take().await;
-                        //     let candles = app.candles_handler(&position.inner.id).take().await;
-                        //     if let (Ok(product), Ok(candles)) = (product, candles) {
-                        //         if let Some(avg_dd) = candles.average_drawdown(12) {
-                        //             if let Some(Some(avg_dd_value)) = avg_dd.values.last() {
-                        //                 let last_price = candles.open.last().unwrap();
-                        //                 let stop_loss = last_price * (1.0 - avg_dd_value * n as f64);
-                        //                 table.add_row(vec![
-                        //                     comfy_table::Cell::new(product.inner.id.clone()),
-                        //                     comfy_table::Cell::new(format!(
-                        //                         "{:<24}",
-                        //                         product.inner.name.chars().take(24).collect::<String>()
-                        //                     )),
-                        //                     comfy_table::Cell::new(product.inner.symbol.clone()),
-                        //                     comfy_table::Cell::new(
-                        //                         candles.time.last().unwrap().to_string(),
-                        //                     ),
-                        //                     comfy_table::Cell::new(last_price)
-                        //                         .set_alignment(comfy_table::CellAlignment::Right),
-                        //                     comfy_table::Cell::new(format!("{:.2}", avg_dd_value))
-                        //                         .set_alignment(comfy_table::CellAlignment::Right),
-                        //                     comfy_table::Cell::new(format!("{:.2}", stop_loss))
-                        //                         .set_alignment(comfy_table::CellAlignment::Right),
-                        //                 ]);
-                        //             }
-                        //         }
-                        //     } else {
-                        //         eprintln!("Failed to get data for {}", &position.inner.id);
-                        //     };
-                        // }
-                        // print!("{}", table);
+                        let msg = server::Request::RecalculateSl { n };
+                        match client.write(msg).await {
+                            Some(Response::SendRecalcucatetSl { table }) => {
+                                if let Some(table) = table {
+                                    println!("{}", table);
+                                }
+                            }
+                            Some(_) => error!("Unexpected response"),
+                            None => warn!("No response"),
+                        }
                     }
                     Commands::CalculatePortfolio {
                         mode,
@@ -253,6 +268,7 @@ impl CliExt for Eve<App> {
                         min_class,
                         max_class,
                         short_sales_constraint,
+                        roic_wacc_delta,
                     } => {
                         let req = server::Request::CalculatePortfolio {
                             mode,
@@ -266,6 +282,7 @@ impl CliExt for Eve<App> {
                             min_class,
                             max_class,
                             short_sales_constraint,
+                            roic_wacc_delta,
                         };
                         match client.write(req).await {
                             Some(Response::SendPortfolio { portfolio }) => {
@@ -279,13 +296,36 @@ impl CliExt for Eve<App> {
                             None => warn!("No response"),
                         }
                     }
+                    Commands::CleanUp => {
+                        let msg = server::Request::CleanUp;
+                        client.write(msg).await.or_else(|| {
+                            warn!("No response");
+                            None
+                        });
+                    }
                 }
             }
             None => {
                 let addr = Ipv4Addr::new(127, 0, 0, 1);
                 let socket = SocketAddrV4::new(addr, port);
-                match server::Server::new(socket, self.clone()).await {
-                    Ok(mut server) => server.run().await,
+                match server::Server::new(socket).await {
+                    Ok(server) => {
+                        let mop = MasterOfPuppets::default();
+                        let settings = Settings::new(None);
+                        let _settings_address = PuppetBuilder::new(settings.clone())
+                            .spawn(&mop)
+                            .await
+                            .unwrap();
+                        let _server_address = PuppetBuilder::new(server).spawn(&mop).await.unwrap();
+                        let _db_address = PuppetBuilder::new(Db::new()).spawn(&mop).await.unwrap();
+                        let degiro = Degiro::new(&settings.username, &settings.password);
+                        let _degiro_address = PuppetBuilder::new(degiro).spawn(&mop).await.unwrap();
+                        let _calculator_address =
+                            PuppetBuilder::new(Calculator::new(settings.clone()))
+                                .spawn(&mop)
+                                .await
+                                .unwrap();
+                    }
                     Err(err) => println!("{err}"),
                 }
 

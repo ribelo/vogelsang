@@ -1,41 +1,71 @@
+#![warn(clippy::correctness)]
+#![warn(clippy::arithmetic_side_effects)]
+#![warn(clippy::assertions_on_result_states)]
+#![warn(clippy::clone_on_ref_ptr)]
+#![warn(clippy::deref_by_slicing)]
+#![warn(clippy::empty_structs_with_brackets)]
+#![warn(clippy::error_impl_error)]
+#![warn(clippy::filetype_is_file)]
+#![warn(clippy::float_cmp_const)]
+#![warn(clippy::float_cmp)]
+#![warn(clippy::format_push_string)]
+#![warn(clippy::get_unwrap)]
+#![warn(clippy::if_then_some_else_none)]
+#![warn(clippy::integer_division)]
+#![warn(clippy::lossy_float_literal)]
+#![warn(clippy::map_err_ignore)]
+#![warn(clippy::mixed_read_write_in_expression)]
+#![warn(clippy::multiple_inherent_impl)]
+#![warn(clippy::rc_buffer)]
+#![warn(clippy::rc_mutex)]
+#![warn(clippy::redundant_type_annotations)]
+#![warn(clippy::str_to_string)]
+#![warn(clippy::string_add)]
+#![warn(clippy::try_err)]
+#![warn(clippy::must_use_candidate)]
+#![warn(clippy::inefficient_to_string)]
+#![warn(clippy::manual_let_else)]
+#![warn(clippy::manual_ok_or)]
+#![warn(clippy::manual_string_new)]
+#![warn(clippy::nursery)]
+
 use anyhow::Result;
-use eventual::eve::{Eve, EveBuilder};
-use eventual::event_handler::{self, State};
-use eventual::Event;
+use master_of_puppets::{master_of_puppets::MasterOfPuppets, puppet::PuppetBuilder};
 use tokio::signal;
 use tracing::info;
-use vogelsang::events::authorize::Authorize;
-use vogelsang::events::calculate_portfolio::CalculatePorftolio;
-use vogelsang::events::fetch_data::FetchData;
-use vogelsang::events::get_candles::GetCandles;
-use vogelsang::events::get_product::GetProduct;
-use vogelsang::events::login::Login;
-use vogelsang::events::single_allocation::GetSingleAllocation;
-use vogelsang::settings::Settings;
-use vogelsang::subs;
-use vogelsang::{cli::CliExt, events, App};
+
+pub mod cli;
+pub mod cmd;
+pub mod portfolio;
+pub mod puppet;
+pub mod server;
+
+use crate::{
+    cli::CliExt,
+    puppet::{db::Db, degiro::Degiro},
+};
+
+#[derive(Debug, Clone)]
+pub struct App {}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().pretty().init();
     info!("Starting Vogelsang...");
 
-    let settings = Settings::new(None);
-    let degiro = degiro_rs::client::ClientBuilder::default()
-        .username(&settings.username)
-        .password(&settings.password)
-        .build()?;
-    let app = App { settings, degiro };
-    let eve = EveBuilder::new(app)
-        .reg_handler::<Login, _, _>(events::login::login)?
-        .reg_handler::<Authorize, _, _>(events::authorize::authorize)?
-        .reg_handler::<FetchData, _, _>(events::fetch_data::fetch_data)?
-        .reg_handler::<GetProduct, _, _>(events::get_product::get_product)?
-        .reg_handler::<GetCandles, _, _>(events::get_candles::get_candles)?
-        .reg_handler::<GetSingleAllocation, _, _>(events::single_allocation::get_single_allocation)?
-        .reg_handler::<CalculatePorftolio, _, _>(events::calculate_portfolio::calculate_portfolio)?
-        .reg_memo(subs::products::products)
-        .build()?;
-    eve.run().await.unwrap();
+    let app = App::new();
+    app.run().await.unwrap();
     Ok(())
 }

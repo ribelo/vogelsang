@@ -1,24 +1,39 @@
-use std::net::{SocketAddr, SocketAddrV4};
+use core::fmt;
+use std::{
+    net::{SocketAddr, SocketAddrV4},
+    sync::Arc,
+};
 
+use async_trait::async_trait;
 use atomic_take::AtomicTake;
 use chrono::Duration;
-use degiro_rs::api::product::ProductInner;
+use degiro_rs::api::{financial_statements::FinancialReports, product::ProductDetails};
 use erfurt::prelude::Candles;
-use eventual::eve::Eve;
 use futures::SinkExt;
+use master_of_puppets::{
+    executor::SequentialExecutor,
+    prelude::*,
+    puppet::Lifecycle,
+    supervision::strategy::{OneForAll, OneToOne},
+};
 use serde::{Deserialize, Serialize};
+use strum::Display;
 use thiserror::Error;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    task::JoinHandle,
+};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
-    events::{
-        self, calculate_portfolio::CalculatePorftolio, single_allocation::GetSingleAllocation,
-    },
     portfolio::RiskMode,
-    App,
+    puppet::{
+        db::{CandlesQuery, CleanUp, Db, FinanclaReportsQuery, ProductQuery},
+        degiro::{Authorize, Degiro, FetchData, GetPortfolio},
+        portfolio::{CalculatePortfolio, CalculateSl, Calculator, GetSingleAllocation},
+    },
 };
 
 #[derive(Debug)]
@@ -32,28 +47,90 @@ pub struct Client {
     pub addr: SocketAddr,
 }
 
+#[derive(Debug, Clone)]
 pub struct Server {
-    pub eve: Eve<App>,
-    pub listener: TcpListener,
+    pub listener: Arc<TcpListener>,
     pub addr: String,
+    pub handle: Option<Arc<JoinHandle<()>>>,
+}
+
+#[async_trait]
+impl Lifecycle for Server {
+    type Supervision = OneToOne;
+
+    async fn reset(&self, puppeter: &Puppeter) -> Result<Self, CriticalError> {
+        let socket: SocketAddrV4 = self
+            .addr
+            .parse()
+            .map_err(|_| CriticalError::new(puppeter.pid, "Can't parse address"))?;
+
+        Self::new(socket)
+            .await
+            .map_err(|e| CriticalError::new(puppeter.pid, e.to_string()))
+    }
+
+    async fn on_init(&mut self, puppeter: &Puppeter) -> Result<(), PuppetError> {
+        let cloned_self = self.clone();
+        let cloned_puppeter = puppeter.clone();
+        info!("Starting server on {}", self.addr);
+        let handle = tokio::spawn(async move {
+            loop {
+                let (socket, _) = cloned_self.listener.accept().await.unwrap();
+                let mut frame = Framed::new(socket, LengthDelimitedCodec::new());
+                // TODO:
+                let (res_tx, mut res_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<Option<Response>>();
+                let cloned_puppeter = cloned_puppeter.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            Some(msg) = res_rx.recv() => {
+                                info!(msg = ?msg, "Sending message");
+                                let bytes = bincode::serialize(&msg).unwrap();
+                                frame.send(bytes.into()).await.unwrap();
+                            }
+                            framed = frame.next() => {
+                                match framed {
+                                    Some(Ok(buf)) => {
+                                        let req: Request = bincode::deserialize(&buf).unwrap();
+                                        info!(req =? req, "Received message");
+                                        req.process(&res_tx, &cloned_puppeter).await;
+                                    }
+                                    Some(Err(err)) => {
+                                        dbg!(err);
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        self.handle = Some(Arc::new(handle));
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Request {
     Ping,
     Pong,
-    Login,
+    Authorize,
     FetchData {
         id: Option<String>,
     },
     GetProduct {
-        query: crate::data::products::ProductQuery,
+        query: ProductQuery,
+    },
+    GetFinancials {
+        query: ProductQuery,
     },
     GetCandles {
-        query: crate::data::products::ProductQuery,
+        query: ProductQuery,
     },
     GetSingleAllocation {
-        query: crate::data::products::ProductQuery,
+        query: ProductQuery,
         mode: RiskMode,
         risk: f64,
         risk_free: f64,
@@ -62,24 +139,48 @@ pub enum Request {
         mode: RiskMode,
         risk: f64,
         risk_free: f64,
-        freq: u32,
+        freq: usize,
         money: f64,
-        max_stocks: i32,
+        max_stocks: usize,
         min_rsi: Option<f64>,
         max_rsi: Option<f64>,
         min_class: Option<degiro_rs::util::ProductCategory>,
         max_class: Option<degiro_rs::util::ProductCategory>,
         short_sales_constraint: bool,
+        roic_wacc_delta: Option<f64>,
     },
+    RecalculateSl {
+        n: usize,
+    },
+    GetPortfolio,
+    CleanUp,
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Response {
-    SendProduct { product: Option<ProductInner> },
-    SendCandles { candles: Option<Candles> },
-    SendSingleAllocation { single_allocation: Option<f64> },
-    SendPortfolio { portfolio: Option<String> },
+    SendProduct {
+        product: Option<ProductDetails>,
+    },
+    SendFinancials {
+        financials: Option<FinancialReports>,
+    },
+    SendCandles {
+        candles: Option<Candles>,
+    },
+    SendSingleAllocation {
+        single_allocation: Option<f64>,
+    },
+    SendPortfolio {
+        portfolio: Option<String>,
+    },
+    SendRecalcucatetSl {
+        table: Option<String>,
+    },
+    SendPortfolioSl {
+        table: Option<String>,
+    },
+    SendCleanUp,
 }
 
 #[derive(Debug, Deserialize, Error, Serialize)]
@@ -98,48 +199,14 @@ pub enum ServerError {
 }
 
 impl Server {
-    pub async fn new(
-        socket: impl Into<SocketAddrV4>,
-        eve: Eve<App>,
-    ) -> Result<Self, tokio::io::Error> {
+    pub async fn new(socket: impl Into<SocketAddrV4>) -> Result<Self, tokio::io::Error> {
         let addr = socket.into();
         let listener = TcpListener::bind(&addr).await?;
         Ok(Self {
-            eve,
-            listener,
+            listener: Arc::new(listener),
             addr: addr.to_string(),
+            handle: None,
         })
-    }
-    pub async fn run(&mut self) {
-        loop {
-            let (socket, _) = self.listener.accept().await.unwrap();
-            let mut frame = Framed::new(socket, LengthDelimitedCodec::new());
-            // TODO:
-            let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel::<Option<Response>>();
-            let eve = self.eve.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        Some(msg) = res_rx.recv() => {
-                            let bytes = bincode::serialize(&msg).unwrap();
-                            frame.send(bytes.into()).await.unwrap();
-                        }
-                        framed = frame.next() => {
-                            match framed {
-                                Some(Ok(buf)) => {
-                                    let req: Request = bincode::deserialize(&buf).unwrap();
-                                    req.process(&eve, &res_tx).await;
-                                }
-                                Some(Err(err)) => {
-                                    dbg!(err);
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
-            });
-        }
     }
 }
 
@@ -195,61 +262,60 @@ impl Client {
 impl Request {
     pub async fn process(
         self,
-        eve: &Eve<App>,
         res_tx: &tokio::sync::mpsc::UnboundedSender<Option<Response>>,
+        puppeter: &Puppeter,
     ) {
         match self {
             Request::Ping => todo!(),
             Request::Pong => todo!(),
-            Request::Login => {
-                let event = events::login::Login {};
-                eve.dispatch(event).await.unwrap_or_else(|err| {
-                    tracing::error!(error = %err, "Failed to dispatch login event");
-                });
+            Request::Authorize => {
+                puppeter
+                    .ask::<Degiro, _>(Authorize)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::error!(error = %err, "Failed to authorize");
+                    });
                 res_tx.send(None).unwrap();
             }
             Request::FetchData { id } => {
-                let event = events::fetch_data::FetchData { id, name: None };
-                eve.dispatch(event).await.unwrap_or_else(|err| {
-                    tracing::error!(error = %err, "Failed to dispatch fetch data event");
+                let msg = FetchData { id, name: None };
+                puppeter.send::<Degiro, _>(msg).await.unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "Failed to fetch data");
                 });
                 res_tx.send(None).unwrap();
             }
             Request::GetProduct { query } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let event = events::get_product::GetProduct {
-                    query,
-                    tx: AtomicTake::new(tx),
-                };
-                eve.dispatch(event).await.unwrap_or_else(|err| {
-                    tracing::error!(error = %err, "Failed to dispatch get product event");
+                let product = puppeter.ask::<Db, _>(query).await.unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "Failed to get product");
+                    None
                 });
-                if let Ok(product) = rx.await {
-                    res_tx
-                        .send(Some(Response::SendProduct { product }))
-                        .unwrap();
-                } else {
-                    error!("Failed to get product. Response channel closed");
-                    res_tx.send(None).unwrap();
-                }
+                res_tx
+                    .send(Some(Response::SendProduct { product }))
+                    .unwrap();
+            }
+            Request::GetFinancials { query } => {
+                let financials = puppeter
+                    .ask::<Db, _>(FinanclaReportsQuery::from(query))
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::error!(error = %err, "Failed to get product");
+                        None
+                    });
+                res_tx
+                    .send(Some(Response::SendFinancials { financials }))
+                    .unwrap();
             }
             Request::GetCandles { query } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let event = events::get_candles::GetCandles {
-                    query,
-                    tx: AtomicTake::new(tx),
-                };
-                eve.dispatch(event).await.unwrap_or_else(|err| {
-                    tracing::error!(error = %err, "Failed to dispatch get candles event");
-                });
-                if let Ok(candles) = rx.await {
-                    res_tx
-                        .send(Some(Response::SendCandles { candles }))
-                        .unwrap();
-                } else {
-                    error!("Failed to get candles. Response channel closed");
-                    res_tx.send(None).unwrap();
-                }
+                let candles = puppeter
+                    .ask::<Db, _>(CandlesQuery::from(query))
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::error!(error = %err, "Failed to get product");
+                        None
+                    });
+                res_tx
+                    .send(Some(Response::SendCandles { candles }))
+                    .unwrap();
             }
             Request::GetSingleAllocation {
                 query,
@@ -257,25 +323,24 @@ impl Request {
                 risk,
                 risk_free,
             } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let event = GetSingleAllocation {
-                    query,
+                let msg = GetSingleAllocation {
+                    query: query.into(),
                     mode,
                     risk,
                     risk_free,
-                    tx: AtomicTake::new(tx),
                 };
-                eve.dispatch(event).await.unwrap_or_else(|err| {
-                    tracing::error!(error = %err, "Failed to dispatch get single allocation event");
-                });
-                if let Ok(single_allocation) = rx.await {
-                    res_tx
-                        .send(Some(Response::SendSingleAllocation { single_allocation }))
-                        .unwrap();
-                } else {
-                    error!("Failed to get single allocation. Response channel closed");
-                    res_tx.send(None).unwrap();
-                }
+                let allocation = puppeter
+                    .ask::<Calculator, _>(msg)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::error!(error = %err, "Failed to get single allocation");
+                        None
+                    });
+                res_tx
+                    .send(Some(Response::SendSingleAllocation {
+                        single_allocation: allocation,
+                    }))
+                    .unwrap();
             }
             Request::CalculatePortfolio {
                 mode,
@@ -289,10 +354,9 @@ impl Request {
                 min_class,
                 max_class,
                 short_sales_constraint,
+                roic_wacc_delta,
             } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let event = CalculatePorftolio {
-                    tx: AtomicTake::new(tx),
+                let msg = CalculatePortfolio {
                     mode,
                     risk,
                     risk_free,
@@ -304,18 +368,31 @@ impl Request {
                     min_class,
                     max_class,
                     short_sales_constraint,
+                    roic_wacc_delta,
                 };
-                eve.dispatch(event).await.unwrap_or_else(|err| {
-                    tracing::error!(error = %err, "Failed to dispatch calculate portfolio event");
-                });
-                if let Ok(portfolio) = rx.await {
-                    res_tx
-                        .send(Some(Response::SendPortfolio { portfolio }))
-                        .unwrap();
-                } else {
-                    error!("Failed to get portfolio. Response channel closed");
-                    res_tx.send(None).unwrap();
-                }
+                let portfolio = puppeter.ask::<Calculator, _>(msg).await.ok();
+                res_tx
+                    .send(Some(Response::SendPortfolio { portfolio }))
+                    .unwrap();
+            }
+            Request::RecalculateSl { n } => {
+                let msg = CalculateSl { n };
+                let table = puppeter.ask::<Calculator, _>(msg).await.ok();
+                res_tx
+                    .send(Some(Response::SendRecalcucatetSl { table }))
+                    .unwrap();
+            }
+            Request::GetPortfolio => {
+                let msg = GetPortfolio;
+                let portfolio = puppeter.ask::<Calculator, _>(msg).await.ok();
+                res_tx
+                    .send(Some(Response::SendPortfolio { portfolio }))
+                    .unwrap();
+            }
+            Request::CleanUp => {
+                let msg = CleanUp;
+                puppeter.send::<Db, _>(msg).await.ok();
+                res_tx.send(Some(Response::SendCleanUp)).unwrap();
             }
         }
     }

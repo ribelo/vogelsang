@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use degiro_rs::{
-    api::{product::Product, quotes::Quotes},
+    api::{
+        product::{Product, ProductDetails},
+        quotes::Quotes,
+    },
     util::Period,
 };
 use erfurt::candle::Candles;
@@ -14,7 +17,6 @@ use qualsdorf::{
 use serde::{Deserialize, Serialize};
 use statrs::statistics::Statistics;
 use strum::EnumString;
-use tap::Tap;
 
 #[derive(Debug)]
 pub struct LSV {
@@ -177,25 +179,20 @@ impl SingleAllocation for Candles {
     }
 }
 
-pub struct AssetsSeq(pub Vec<(Product, Candles)>);
+pub struct AssetsSeq(pub Vec<(ProductDetails, Candles)>);
 
-impl From<Vec<(Product, Candles)>> for AssetsSeq {
-    fn from(xs: Vec<(Product, Candles)>) -> Self {
+impl From<Vec<(ProductDetails, Candles)>> for AssetsSeq {
+    fn from(xs: Vec<(ProductDetails, Candles)>) -> Self {
         AssetsSeq(xs)
     }
 }
 
 fn na_covariance(matrix: &na::DMatrix<f64>) -> na::DMatrix<f64> {
-    println!("Input matrix shape: {:?}", matrix.shape());
     let nrows = matrix.nrows(); // Number of instruments
     let ncols = matrix.ncols(); // Number of observations
 
     // The covariance matrix should be a square matrix with dimensions equal to the number of instruments
     let mut covariance_matrix = na::DMatrix::zeros(nrows, nrows);
-    println!(
-        "Covariance matrix dimensions: {:?}",
-        covariance_matrix.shape()
-    );
 
     let means = matrix.row_mean(); // Using row_mean for mean of each feature
 
@@ -229,14 +226,13 @@ impl AssetsSeq {
         period: Period,
         interval: Period,
         short_sales_constraint: bool,
-    ) -> Result<Vec<(Product, f64)>> {
+    ) -> Result<Vec<(ProductDetails, f64)>> {
         let freq = period.div(interval);
         let mut rets_rows = Vec::new();
 
         let mut ys = Vec::new();
         let mut mu = Vec::new();
         for (_p, candles) in self.0.clone() {
-            println!("id: {}", &_p.inner.id);
             let ret = candles
                 .ret()
                 .ok_or_else(|| anyhow!("can't calculate return"))?;
@@ -266,20 +262,17 @@ impl AssetsSeq {
             ys.push(y);
             mu.push(drift);
         }
-        let rets = na::DMatrix::from_rows(&rets_rows)
-            .tap(|x| println!("rets dimensions: {:?} {}", x.shape(), x.as_slice().len()));
+        let rets = na::DMatrix::from_rows(&rets_rows);
         let ys = na::DVector::<f64>::from_vec(ys);
-        let mu =
-            na::DVector::<f64>::from_vec(mu).tap(|x| println!("mu dimensions: {:?}", x.shape()));
-        let sigma = na_covariance(&rets).tap(|x| println!("sigma dimensions: {:?}", x.shape()));
+        let mu = na::DVector::<f64>::from_vec(mu);
+        let sigma = na_covariance(&rets);
         if !sigma.is_invertible() {
             return Err(anyhow!("Covariance matrix is not invertible"));
         };
         let Some(sigma_inv) = sigma.try_inverse() else {
             return Err(anyhow!("Can't invert covariance matrix"));
         };
-        let diag_y = na::DMatrix::<f64>::from_diagonal(&ys)
-            .tap(|x| println!("diag-Y dimensions: {:?}", x.shape()));
+        let diag_y = na::DMatrix::<f64>::from_diagonal(&ys);
 
         let mut x_redp = ((&sigma_inv * &mu).transpose() * &sigma_inv * &diag_y)
             .as_slice()
@@ -290,11 +283,10 @@ impl AssetsSeq {
 
         let x_redp_sum_abs = x_redp.iter().map(|x| x.abs()).sum::<f64>();
         let x_redp_normalized = x_redp.iter().map(|x| x / x_redp_sum_abs);
-        let mut r: Vec<(Product, f64)> = Vec::new();
+        let mut r: Vec<(ProductDetails, f64)> = Vec::new();
         for ((p, _), allocation) in self.0.iter().zip(x_redp_normalized) {
             if short_sales_constraint {
                 if allocation > 0.0 {
-                    // println!("{} allocation {}", &p.inner.name, allocation,);
                     r.push((p.clone(), allocation));
                 }
             } else {

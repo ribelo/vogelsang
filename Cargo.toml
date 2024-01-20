@@ -13,7 +13,7 @@ members = []
 erfurt = { path = "../erfurt" }
 degiro-rs = { path = "../degiro-rs", features = ["erfurt"] }
 qualsdorf = { path = "../qualsdorf" }
-eventual = { path = "../eventual" }
+master-of-puppets = { path = "../master_of_puppets/" }
 async-trait = "0.1.57"
 statrs = "0.16.0"
 tokio = { version = "1.21.1", features = ["full"] }
@@ -42,3 +42,4 @@ tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 atomic-take = "1.1.0"
 regex = "1.10.2"
+heed = "0.11.0"
