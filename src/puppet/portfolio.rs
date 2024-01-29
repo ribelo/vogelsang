@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     portfolio::{AssetsSeq, RiskMode, SingleAllocation},
-    puppet::degiro::{Degiro, GetPortfolio},
+    puppet::degiro::{Degiro, GetOrders, GetPortfolio},
 };
 
 use super::{
@@ -33,7 +33,8 @@ pub struct Calculator {
 }
 
 impl Calculator {
-    pub fn new(settings: Settings) -> Self {
+    #[must_use]
+    pub const fn new(settings: Settings) -> Self {
         Self { settings }
     }
 }
@@ -91,9 +92,12 @@ pub struct CalculatePortfolio {
     pub max_stocks: usize,
     pub min_rsi: Option<f64>,
     pub max_rsi: Option<f64>,
+    pub min_dd: Option<f64>,
+    pub max_dd: Option<f64>,
     pub min_class: Option<ProductCategory>,
     pub max_class: Option<ProductCategory>,
     pub short_sales_constraint: bool,
+    pub min_roic: Option<f64>,
     pub roic_wacc_delta: Option<f64>,
 }
 
@@ -175,7 +179,6 @@ impl Handler<GetDataEntry> for Calculator {
                     let current_year = chrono::Utc::now().year();
                     let Some(annual_report) = financials.get_annual(current_year - 1) else {
                         warn!("No annual report for {} in {}", &product.id, current_year);
-                        dbg!(&financials);
                         return Ok(None);
                     };
                     let roic = annual_report.roic();
@@ -234,7 +237,10 @@ impl Handler<CalculatePortfolio> for Calculator {
             max_stock: msg.max_stocks as i32,
             min_rsi: msg.min_rsi,
             max_rsi: msg.max_rsi,
+            min_dd: msg.min_dd,
+            max_dd: msg.max_dd,
             short_sales_constraint: msg.short_sales_constraint,
+            min_roic: msg.min_roic,
             roic_wacc_delta: msg.roic_wacc_delta,
             data: Arc::new(data),
         };
@@ -251,7 +257,10 @@ pub struct PortfolioCalculator {
     max_stock: i32,
     min_rsi: Option<f64>,
     max_rsi: Option<f64>,
+    min_dd: Option<f64>,
+    max_dd: Option<f64>,
     short_sales_constraint: bool,
+    min_roic: Option<f64>,
     roic_wacc_delta: Option<f64>,
     pub data: Arc<DashMap<String, DataEntry>>,
 }
@@ -280,6 +289,7 @@ impl PortfolioCalculator {
                 rsi,
                 roic,
                 wacc,
+                redp,
                 ..
             } = entry.value();
             let last_candle_month = candles.time.last().unwrap().month();
@@ -302,6 +312,27 @@ impl PortfolioCalculator {
                 if *rsi < min_rsi_value || *rsi > max_rsi_value {
                     println!("RSI is out of range for {} : {}", id, product.name);
                     println!("Should be: {} < {} < {}", min_rsi_value, rsi, max_rsi_value);
+                    to_remove.insert(id.clone());
+                }
+            }
+
+            if *roic < self.min_roic.unwrap_or(0.0) {
+                println!("ROIC is out of range for {} : {}", id, product.name);
+                println!("Should be: {} < {}", self.min_roic.unwrap_or(0.0), roic);
+                to_remove.insert(id.clone());
+            }
+
+            if let Some(min_dd) = self.min_dd {
+                if *redp < min_dd {
+                    println!("Min DD is out of range for {} : {}", id, product.name);
+                    println!("Should be: {} < {}", redp, min_dd);
+                    to_remove.insert(id.clone());
+                }
+            }
+            if let Some(max_dd) = self.max_dd {
+                if *redp > max_dd {
+                    println!("Max DD is out of range for {} : {}", id, product.name);
+                    println!("Should be: {} > {}", redp, max_dd);
                     to_remove.insert(id.clone());
                 }
             }
@@ -418,6 +449,7 @@ impl PortfolioCalculator {
         }
     }
 
+    #[must_use]
     pub fn as_table(&self) -> Table {
         let mut table = Table::new();
         let header = vec![
@@ -435,7 +467,6 @@ impl PortfolioCalculator {
             "wacc",
             "rsi",
             "redp",
-            "class",
         ];
         table.set_header(header);
         table.load_preset(UTF8_BORDERS_ONLY);
@@ -485,7 +516,6 @@ impl PortfolioCalculator {
                 Cell::new(format!("{:.2}", wacc)),
                 Cell::new(format!("{:.2}", rsi)),
                 Cell::new(format!("{:.2}", redp)),
-                Cell::new(product.category.to_string()),
             ]);
         }
 
@@ -511,6 +541,7 @@ impl Handler<CalculateSl> for Calculator {
     ) -> Result<Self::Response, PuppetError> {
         info!("Calculating stop losses...");
         let portfolio = puppeter.ask::<Degiro, _>(GetPortfolio).await?;
+        let orders = puppeter.ask::<Degiro, _>(GetOrders).await?;
         let mut table = comfy_table::Table::new();
         let header = vec![
             comfy_table::Cell::new("id"),
@@ -524,6 +555,9 @@ impl Handler<CalculateSl> for Calculator {
         table.set_header(header);
         table.load_preset(UTF8_BORDERS_ONLY);
         for position in portfolio.0.iter() {
+            let Ok(product_id) = position.inner.id.parse::<u64>() else {
+                continue;
+            };
             if position.inner.size <= 0.0 {
                 continue;
             }
@@ -533,11 +567,26 @@ impl Handler<CalculateSl> for Calculator {
             let candles = puppeter
                 .ask::<Db, _>(CandlesQuery::Id(position.inner.id.clone()))
                 .await?;
+            let old_sl = orders
+                .filter_product_id(product_id)
+                .first()
+                .map(|o| o.stop_price);
             if let (Some(product), Some(candles)) = (product, candles) {
                 if let Some(avg_dd) = candles.average_drawdown(12) {
                     if let Some(Some(avg_dd_value)) = avg_dd.values.last() {
-                        let last_price = candles.close.last().unwrap();
-                        let stop_loss = last_price * (1.0 - avg_dd_value * msg.n as f64);
+                        let Some(last_price) = candles.close.last() else {
+                            return Err(PuppetError::critical(
+                                puppeter.pid,
+                                "Failed to get last price",
+                            ));
+                        };
+                        let Some(last_time) = candles.time.last() else {
+                            return Err(PuppetError::critical(
+                                puppeter.pid,
+                                "Failed to get last time",
+                            ));
+                        };
+                        let new_stop = last_price * (1.0 - avg_dd_value * msg.n as f64);
                         table.add_row(vec![
                             comfy_table::Cell::new(product.id.clone()),
                             comfy_table::Cell::new(format!(
@@ -545,13 +594,26 @@ impl Handler<CalculateSl> for Calculator {
                                 product.name.chars().take(24).collect::<String>()
                             )),
                             comfy_table::Cell::new(product.symbol.clone()),
-                            comfy_table::Cell::new(candles.time.last().unwrap().to_string()),
+                            comfy_table::Cell::new(last_time.to_string()),
                             comfy_table::Cell::new(last_price)
                                 .set_alignment(comfy_table::CellAlignment::Right),
                             comfy_table::Cell::new(format!("{:.2}", avg_dd_value))
                                 .set_alignment(comfy_table::CellAlignment::Right),
-                            comfy_table::Cell::new(format!("{:.2}", stop_loss))
-                                .set_alignment(comfy_table::CellAlignment::Right),
+                            match (new_stop, old_sl) {
+                                (new_sl, None) => comfy_table::Cell::new(format!("{:.2}", new_sl))
+                                    .set_alignment(comfy_table::CellAlignment::Right)
+                                    .fg(comfy_table::Color::Red),
+                                (new_sl, Some(old_sl)) if old_sl >= new_sl => {
+                                    comfy_table::Cell::new(format!("{:.2}", new_sl))
+                                        .set_alignment(comfy_table::CellAlignment::Right)
+                                        .fg(comfy_table::Color::Yellow)
+                                }
+                                (new_sl, Some(_)) => {
+                                    comfy_table::Cell::new(format!("{:.2}", new_sl))
+                                        .set_alignment(comfy_table::CellAlignment::Right)
+                                        .fg(comfy_table::Color::Green)
+                                }
+                            },
                         ]);
                     }
                 }
@@ -571,7 +633,7 @@ impl Handler<GetPortfolio> for Calculator {
 
     async fn handle_message(
         &mut self,
-        msg: GetPortfolio,
+        _msg: GetPortfolio,
         puppeter: &Puppeter,
     ) -> Result<Self::Response, PuppetError> {
         let portfolio = puppeter.ask::<Degiro, _>(GetPortfolio).await?;

@@ -8,7 +8,6 @@ use degiro_rs::api::{
 use erfurt::prelude::Candles;
 use master_of_puppets::prelude::*;
 use serde::{Deserialize, Serialize};
-use tap::Tap;
 use tracing::{error, info};
 
 use super::settings::{GetSettings, Settings};
@@ -30,6 +29,7 @@ impl fmt::Debug for Db {
 }
 
 impl Db {
+    #[must_use]
     pub fn new() -> Self {
         std::fs::create_dir_all("vogelsang.mdb").expect("Failed to create db directory.");
         let env = heed::EnvOpenOptions::new()
@@ -81,7 +81,7 @@ impl Handler<ProductDetails> for Db {
         let mut wtx = self
             .env
             .write_txn()
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         self.products.put(&mut wtx, &msg.id, &msg).map_err(|e| {
             error!(
                 id = msg.id,
@@ -89,9 +89,10 @@ impl Handler<ProductDetails> for Db {
                 error = %e,
                 "Failed to save product."
             );
-            puppeter.critical_error(e)
+            PuppetError::critical(puppeter.pid, e)
         })?;
-        wtx.commit().map_err(|e| puppeter.critical_error(e).into())
+        wtx.commit()
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))
     }
 }
 
@@ -110,7 +111,7 @@ impl Handler<Quotes> for Db {
         let mut wtx = self
             .env
             .write_txn()
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         let candles = Candles::from(msg.clone());
         self.candles.put(&mut wtx, &msg.id, &candles).map_err(|e| {
             error!(
@@ -118,9 +119,10 @@ impl Handler<Quotes> for Db {
                 error = %e,
                 "Failed to save candles."
             );
-            puppeter.critical_error(e)
+            PuppetError::critical(puppeter.pid, e)
         })?;
-        wtx.commit().map_err(|e| puppeter.critical_error(e).into())
+        wtx.commit()
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))
     }
 }
 
@@ -137,7 +139,7 @@ impl Handler<FinancialReports> for Db {
         let mut wtx = self
             .env
             .write_txn()
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         self.financial_reports
             .put(&mut wtx, &msg.id, &msg)
             .map_err(|e| {
@@ -146,9 +148,10 @@ impl Handler<FinancialReports> for Db {
                     error = %e,
                     "Failed to save financial reports."
                 );
-                puppeter.critical_error(e)
+                PuppetError::critical(puppeter.pid, e)
             })?;
-        wtx.commit().map_err(|e| puppeter.critical_error(e).into())
+        wtx.commit()
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))
     }
 }
 
@@ -165,7 +168,7 @@ impl Handler<CompanyRatios> for Db {
         let mut wtx = self
             .env
             .write_txn()
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         self.company_ratios
             .put(&mut wtx, &msg.id, &msg)
             .map_err(|e| {
@@ -174,9 +177,10 @@ impl Handler<CompanyRatios> for Db {
                     error = %e,
                     "Failed to save company ratios."
                 );
-                puppeter.critical_error(e)
+                PuppetError::critical(puppeter.pid, e)
             })?;
-        wtx.commit().map_err(|e| puppeter.critical_error(e).into())
+        wtx.commit()
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))
     }
 }
 
@@ -201,19 +205,19 @@ impl Handler<ProductQuery> for Db {
         let rtxn = self
             .env
             .read_txn()
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         match msg {
             ProductQuery::Id(id) => {
                 return self
                     .products
                     .get(&rtxn, &id)
-                    .map_err(|e| puppeter.critical_error(e).into());
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e));
             }
             ProductQuery::Symbol(symbol) => {
                 let mut iter = self
                     .products
                     .iter(&rtxn)
-                    .map_err(|e| puppeter.critical_error(e))?;
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                 while let Some(Ok((_, product))) = iter.next() {
                     println!("{:?}", product.symbol);
                     if product.symbol.to_lowercase() == symbol.to_lowercase() {
@@ -226,7 +230,7 @@ impl Handler<ProductQuery> for Db {
                 let mut iter = self
                     .products
                     .iter(&rtxn)
-                    .map_err(|e| puppeter.critical_error(e))?;
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                 while let Some(Ok((_, product))) = iter.next() {
                     if rgx.is_match(&product.name) {
                         return Ok(Some(product));
@@ -271,35 +275,35 @@ impl Handler<CandlesQuery> for Db {
                 let rtxn = self
                     .env
                     .read_txn()
-                    .map_err(|e| puppeter.critical_error(e))?;
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                 return self
                     .candles
                     .get(&rtxn, &id)
-                    .map_err(|e| puppeter.critical_error(e).into());
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e));
             }
             CandlesQuery::Symbol(symbol) => {
                 let new_msg = {
                     let rtxn = self
                         .env
                         .read_txn()
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     let mut iter = self
                         .products
                         .iter(&rtxn)
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     iter.find_map(|res| {
                         res.ok()
                             .filter(|(_, product)| {
                                 product.symbol.to_lowercase() == symbol.to_lowercase()
                             })
-                            .map(|(_, product)| CandlesQuery::Id(product.id.clone()))
+                            .map(|(_, product)| CandlesQuery::Id(product.id))
                     })
                 };
                 if let Some(msg) = new_msg {
                     return puppeter
                         .ask::<Self, _>(msg)
                         .await
-                        .map_err(|e| puppeter.critical_error(e).into());
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e));
                 }
                 return Ok(None);
             }
@@ -309,22 +313,22 @@ impl Handler<CandlesQuery> for Db {
                     let rtxn = self
                         .env
                         .read_txn()
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     let mut iter = self
                         .products
                         .iter(&rtxn)
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     iter.find_map(|res| {
                         res.ok()
                             .filter(|(_, product)| rgx.is_match(&product.name))
-                            .map(|(_, product)| CandlesQuery::Id(product.id.clone()))
+                            .map(|(_, product)| CandlesQuery::Id(product.id))
                     })
                 };
                 if let Some(msg) = new_msg {
                     return puppeter
                         .ask::<Self, _>(msg)
                         .await
-                        .map_err(|e| puppeter.critical_error(e).into());
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e));
                 }
                 return Ok(None);
             }
@@ -363,35 +367,35 @@ impl Handler<FinanclaReportsQuery> for Db {
                 let rtxn = self
                     .env
                     .read_txn()
-                    .map_err(|e| puppeter.critical_error(e))?;
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                 return self
                     .financial_reports
                     .get(&rtxn, &id)
-                    .map_err(|e| puppeter.critical_error(e).into());
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e));
             }
             FinanclaReportsQuery::Symbol(symbol) => {
                 let new_msg = {
                     let rtxn = self
                         .env
                         .read_txn()
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     let mut iter = self
                         .products
                         .iter(&rtxn)
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     iter.find_map(|res| {
                         res.ok()
                             .filter(|(_, product)| {
                                 product.symbol.to_lowercase() == symbol.to_lowercase()
                             })
-                            .map(|(_, product)| FinanclaReportsQuery::Id(product.id.clone()))
+                            .map(|(_, product)| FinanclaReportsQuery::Id(product.id))
                     })
                 };
                 if let Some(msg) = new_msg {
                     return puppeter
                         .ask::<Self, _>(msg)
                         .await
-                        .map_err(|e| puppeter.critical_error(e).into());
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e));
                 }
                 return Ok(None);
             }
@@ -401,22 +405,22 @@ impl Handler<FinanclaReportsQuery> for Db {
                     let rtxn = self
                         .env
                         .read_txn()
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     let mut iter = self
                         .products
                         .iter(&rtxn)
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     iter.find_map(|res| {
                         res.ok()
                             .filter(|(_, product)| rgx.is_match(&product.name))
-                            .map(|(_, product)| FinanclaReportsQuery::Id(product.id.clone()))
+                            .map(|(_, product)| FinanclaReportsQuery::Id(product.id))
                     })
                 };
                 if let Some(msg) = new_msg {
                     return puppeter
                         .ask::<Self, _>(msg)
                         .await
-                        .map_err(|e| puppeter.critical_error(e).into());
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e));
                 }
                 return Ok(None);
             }
@@ -455,35 +459,35 @@ impl Handler<CompanyRatiosQuery> for Db {
                 let rtxn = self
                     .env
                     .read_txn()
-                    .map_err(|e| puppeter.critical_error(e))?;
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                 return self
                     .company_ratios
                     .get(&rtxn, &id)
-                    .map_err(|e| puppeter.critical_error(e).into());
+                    .map_err(|e| PuppetError::critical(puppeter.pid, e));
             }
             CompanyRatiosQuery::Symbol(symbol) => {
                 let new_msg = {
                     let rtxn = self
                         .env
                         .read_txn()
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     let mut iter = self
                         .products
                         .iter(&rtxn)
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     iter.find_map(|res| {
                         res.ok()
                             .filter(|(_, product)| {
                                 product.symbol.to_lowercase() == symbol.to_lowercase()
                             })
-                            .map(|(_, product)| CompanyRatiosQuery::Id(product.id.clone()))
+                            .map(|(_, product)| CompanyRatiosQuery::Id(product.id))
                     })
                 };
                 if let Some(msg) = new_msg {
                     return puppeter
                         .ask::<Self, _>(msg)
                         .await
-                        .map_err(|e| puppeter.critical_error(e).into());
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e));
                 }
                 return Ok(None);
             }
@@ -493,22 +497,22 @@ impl Handler<CompanyRatiosQuery> for Db {
                     let rtxn = self
                         .env
                         .read_txn()
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     let mut iter = self
                         .products
                         .iter(&rtxn)
-                        .map_err(|e| puppeter.critical_error(e))?;
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
                     iter.find_map(|res| {
                         res.ok()
                             .filter(|(_, product)| rgx.is_match(&product.name))
-                            .map(|(_, product)| CompanyRatiosQuery::Id(product.id.clone()))
+                            .map(|(_, product)| CompanyRatiosQuery::Id(product.id))
                     })
                 };
                 if let Some(msg) = new_msg {
                     return puppeter
                         .ask::<Self, _>(msg)
                         .await
-                        .map_err(|e| puppeter.critical_error(e).into());
+                        .map_err(|e| PuppetError::critical(puppeter.pid, e));
                 }
                 return Ok(None);
             }
@@ -532,20 +536,21 @@ impl Handler<DeleteData> for Db {
         let mut wtx = self
             .env
             .write_txn()
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         self.candles
             .delete(&mut wtx, &msg.0)
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         self.products
             .delete(&mut wtx, &msg.0)
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         self.financial_reports
             .delete(&mut wtx, &msg.0)
-            .map_err(|e| puppeter.critical_error(e))?;
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         self.company_ratios
             .delete(&mut wtx, &msg.0)
-            .map_err(|e| puppeter.critical_error(e))?;
-        wtx.commit().map_err(|e| puppeter.critical_error(e).into())
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
+        wtx.commit()
+            .map_err(|e| PuppetError::critical(puppeter.pid, e))
     }
 }
 
@@ -568,7 +573,7 @@ impl Handler<CleanUp> for Db {
             .await
             .map_err(|e| {
                 error!(error = %e, "Failed to get settings");
-                puppeter.critical_error(e)
+                PuppetError::critical(puppeter.pid, e)
             })?;
 
         let assets = settings
@@ -581,20 +586,16 @@ impl Handler<CleanUp> for Db {
             let rtxn = self
                 .env
                 .read_txn()
-                .map_err(|e| puppeter.critical_error(e))?;
+                .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
 
             let iter = self
                 .products
                 .iter(&rtxn)
-                .map_err(|e| puppeter.critical_error(e))?;
+                .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
 
             iter.filter_map(|res| {
                 let (id, _) = res.unwrap();
-                if !assets.contains(id) {
-                    Some(id.to_string())
-                } else {
-                    None
-                }
+                (!assets.contains(id)).then(|| id.to_owned())
             })
             .collect::<HashSet<_>>()
         };
@@ -603,9 +604,10 @@ impl Handler<CleanUp> for Db {
             puppeter
                 .ask::<Self, _>(DeleteData(id))
                 .await
-                .map_err(|e| puppeter.critical_error(e))?;
+                .map_err(|e| PuppetError::critical(puppeter.pid, e))?;
         }
 
         Ok(())
     }
 }
+

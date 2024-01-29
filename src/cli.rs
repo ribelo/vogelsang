@@ -2,6 +2,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::NaiveDate;
 use clap::{ArgGroup, Parser, Subcommand};
 use degiro_rs::util::ProductCategory;
 use master_of_puppets::{master_of_puppets::MasterOfPuppets, puppet::PuppetBuilder};
@@ -16,7 +17,7 @@ use crate::{
         portfolio::Calculator,
         settings::Settings,
     },
-    server::{self, ClientBuilder, Response, Server},
+    server::{self, ClientBuilder, Response},
     App,
 };
 
@@ -95,18 +96,31 @@ pub enum Commands {
         #[clap(long)]
         max_rsi: Option<f64>,
         #[clap(long)]
+        min_dd: Option<f64>,
+        #[clap(long)]
+        max_dd: Option<f64>,
+        #[clap(long)]
         min_class: Option<ProductCategory>,
         #[clap(long)]
         max_class: Option<ProductCategory>,
         #[clap(long)]
         short_sales_constraint: bool,
         #[clap(long)]
+        min_roic: Option<f64>,
+        #[clap(long)]
         roic_wacc_delta: Option<f64>,
     },
     RecalculateSl {
-        #[clap(short, default_value = "3")]
+        #[clap(short, default_value = "2")]
         n: usize,
     },
+    GetTransactions {
+        #[clap(short, long)]
+        from_date: NaiveDate,
+        #[clap(short, long)]
+        to_date: NaiveDate,
+    },
+    GetOrders,
     CleanUp,
 }
 
@@ -210,15 +224,22 @@ impl CliExt for App {
                         symbol,
                         name,
                     } => {
-                        let query = if let Some(id) = id {
-                            ProductQuery::Id(id.clone())
-                        } else if let Some(symbol) = symbol {
-                            ProductQuery::Symbol(symbol.clone())
-                        } else if let Some(name) = name {
-                            ProductQuery::Name(name.clone())
-                        } else {
-                            panic!("No valid argument provided for GetProduct");
-                        };
+                        let query = id.map_or_else(
+                            || {
+                                symbol.map_or_else(
+                                    || {
+                                        name.map_or_else(
+                                            || {
+                                                panic!("No valid argument provided for GetProduct");
+                                            },
+                                            ProductQuery::Name,
+                                        )
+                                    },
+                                    ProductQuery::Symbol,
+                                )
+                            },
+                            ProductQuery::Id,
+                        );
                         let msg = server::Request::GetSingleAllocation {
                             query,
                             mode,
@@ -265,9 +286,12 @@ impl CliExt for App {
                         max_stocks,
                         min_rsi,
                         max_rsi,
+                        min_dd,
+                        max_dd,
                         min_class,
                         max_class,
                         short_sales_constraint,
+                        min_roic,
                         roic_wacc_delta,
                     } => {
                         let req = server::Request::CalculatePortfolio {
@@ -279,9 +303,12 @@ impl CliExt for App {
                             max_stocks,
                             min_rsi,
                             max_rsi,
+                            min_dd,
+                            max_dd,
                             min_class,
                             max_class,
                             short_sales_constraint,
+                            min_roic,
                             roic_wacc_delta,
                         };
                         match client.write(req).await {
@@ -303,6 +330,35 @@ impl CliExt for App {
                             None
                         });
                     }
+                    Commands::GetTransactions { from_date, to_date } => {
+                        dbg!(from_date, to_date);
+                        // let msg = server::Request::GetTransactions { from_date, to_date };
+                        // match client.write(msg).await {
+                        //     Some(Response::SendTransactions { table }) => {
+                        //         if let Some(table) = table {
+                        //             println!("{}", table);
+                        //         } else {
+                        //             println!("No transactions found");
+                        //         }
+                        //     }
+                        //     Some(_) => error!("Unexpected response"),
+                        //     None => warn!("No response"),
+                        // }
+                    }
+                    Commands::GetOrders => {
+                        let msg = server::Request::GetOrders;
+                        match client.write(msg).await {
+                            Some(Response::SendOrders { table }) => {
+                                if let Some(table) = table {
+                                    println!("{}", table);
+                                } else {
+                                    println!("No orders found");
+                                }
+                            }
+                            Some(_) => error!("Unexpected response"),
+                            None => warn!("No response"),
+                        }
+                    }
                 }
             }
             None => {
@@ -316,9 +372,10 @@ impl CliExt for App {
                             .spawn(&mop)
                             .await
                             .unwrap();
-                        let _server_address = PuppetBuilder::new(server).spawn(&mop).await.unwrap();
+                        let server_address = PuppetBuilder::new(server).spawn(&mop).await.unwrap();
+                        server_address.send(server::RunServer).await.unwrap();
                         let _db_address = PuppetBuilder::new(Db::new()).spawn(&mop).await.unwrap();
-                        let degiro = Degiro::new(&settings.username, &settings.password);
+                        let degiro = Degiro::new(&settings.username, &settings.password).unwrap();
                         let _degiro_address = PuppetBuilder::new(degiro).spawn(&mop).await.unwrap();
                         let _calculator_address =
                             PuppetBuilder::new(Calculator::new(settings.clone()))

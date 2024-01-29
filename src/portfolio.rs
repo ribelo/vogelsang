@@ -26,6 +26,7 @@ pub struct LSV {
 }
 
 impl LSV {
+    #[must_use]
     pub fn new(freq: usize) -> Self {
         Self {
             freq,
@@ -48,7 +49,7 @@ impl Indicator for LSV {
             let last_elements: Vec<f64> = self.input[self.input.len() - self.freq..].to_vec();
             let sum: f64 = last_elements
                 .iter()
-                .map(|&x| f64::min(x, 0.0).powf(2.0))
+                .map(|&x| f64::min(x, 0.0).powi(2))
                 .sum();
             let count = last_elements.len() as f64;
             let avg = sum / count;
@@ -72,12 +73,10 @@ impl Indicator for LSV {
 pub trait LsvExt: ReturnExt {
     fn lsv(&self, freq: usize) -> Option<LSV> {
         let mut indicator = LSV::new(freq);
-        if let Some(ret) = self.ret() {
+        self.ret().map(|ret| {
             ret.into_iter().for_each(|v| indicator.feed(v));
-            Some(indicator)
-        } else {
-            None
-        }
+            indicator
+        })
     }
 }
 
@@ -102,7 +101,7 @@ pub trait SingleAllocation {
 }
 
 #[async_trait]
-impl<'a> SingleAllocation for Product {
+impl SingleAllocation for Product {
     async fn single_allocation(
         &self,
         mode: RiskMode,
@@ -171,10 +170,12 @@ impl SingleAllocation for Candles {
             .last()
             .ok_or_else(|| anyhow!("can't get value"))?
             .to_owned();
-        let allocation =
-            1.0_f64.min(0.0_f64.max(
-                ((sr / risk_metric) + 0.5 / (1.0 - risk.powf(2.0))) * risk - redp / (1.0 - redp),
-            ));
+        let allocation = 1.0_f64.min(
+            0.0_f64.max(
+                ((sr / risk_metric) + 0.5 / risk.mul_add(-risk, 1.0))
+                    .mul_add(risk, -(redp / (1.0 - redp))),
+            ),
+        );
         Ok(allocation)
     }
 }
@@ -183,7 +184,7 @@ pub struct AssetsSeq(pub Vec<(ProductDetails, Candles)>);
 
 impl From<Vec<(ProductDetails, Candles)>> for AssetsSeq {
     fn from(xs: Vec<(ProductDetails, Candles)>) -> Self {
-        AssetsSeq(xs)
+        Self(xs)
     }
 }
 
@@ -254,8 +255,8 @@ impl AssetsSeq {
                 .last()
                 .ok_or_else(|| anyhow!("can't get value"))?
                 .to_owned();
-            let y = (1.0 / (1.0 - risk.powf(2.0))) * ((risk - redp) / (1.0 - redp));
-            let mut drift = mean_ret - risk_free + risk_metric.powf(2.0) / 2.0;
+            let y = (1.0 / risk.mul_add(-risk, 1.0)) * ((risk - redp) / (1.0 - redp));
+            let mut drift = mean_ret - risk_free + risk_metric.powi(2) / 2.0;
             if short_sales_constraint {
                 drift = drift.max(0.0);
             };

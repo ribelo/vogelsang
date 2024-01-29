@@ -1,23 +1,20 @@
-use core::fmt;
 use std::{
     net::{SocketAddr, SocketAddrV4},
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use atomic_take::AtomicTake;
-use chrono::Duration;
-use degiro_rs::api::{financial_statements::FinancialReports, product::ProductDetails};
+use chrono::{Duration, NaiveDate};
+use comfy_table::presets::UTF8_BORDERS_ONLY;
+use degiro_rs::api::{
+    financial_statements::FinancialReports, product::ProductDetails, transactions::Transactions,
+};
 use erfurt::prelude::Candles;
 use futures::SinkExt;
 use master_of_puppets::{
-    executor::SequentialExecutor,
-    prelude::*,
-    puppet::Lifecycle,
-    supervision::strategy::{OneForAll, OneToOne},
+    message::ServiceCommand, prelude::*, puppet::Lifecycle, supervision::strategy::OneToOne,
 };
 use serde::{Deserialize, Serialize};
-use strum::Display;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -31,7 +28,7 @@ use crate::{
     portfolio::RiskMode,
     puppet::{
         db::{CandlesQuery, CleanUp, Db, FinanclaReportsQuery, ProductQuery},
-        degiro::{Authorize, Degiro, FetchData, GetPortfolio},
+        degiro::{Authorize, Degiro, FetchData, GetOrders, GetPortfolio, GetTransactions},
         portfolio::{CalculatePortfolio, CalculateSl, Calculator, GetSingleAllocation},
     },
 };
@@ -51,7 +48,6 @@ pub struct Client {
 pub struct Server {
     pub listener: Arc<TcpListener>,
     pub addr: String,
-    pub handle: Option<Arc<JoinHandle<()>>>,
 }
 
 #[async_trait]
@@ -62,53 +58,11 @@ impl Lifecycle for Server {
         let socket: SocketAddrV4 = self
             .addr
             .parse()
-            .map_err(|_| CriticalError::new(puppeter.pid, "Can't parse address"))?;
+            .map_err(|_err| CriticalError::new(puppeter.pid, "Can't parse address"))?;
 
         Self::new(socket)
             .await
             .map_err(|e| CriticalError::new(puppeter.pid, e.to_string()))
-    }
-
-    async fn on_init(&mut self, puppeter: &Puppeter) -> Result<(), PuppetError> {
-        let cloned_self = self.clone();
-        let cloned_puppeter = puppeter.clone();
-        info!("Starting server on {}", self.addr);
-        let handle = tokio::spawn(async move {
-            loop {
-                let (socket, _) = cloned_self.listener.accept().await.unwrap();
-                let mut frame = Framed::new(socket, LengthDelimitedCodec::new());
-                // TODO:
-                let (res_tx, mut res_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<Option<Response>>();
-                let cloned_puppeter = cloned_puppeter.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            Some(msg) = res_rx.recv() => {
-                                info!(msg = ?msg, "Sending message");
-                                let bytes = bincode::serialize(&msg).unwrap();
-                                frame.send(bytes.into()).await.unwrap();
-                            }
-                            framed = frame.next() => {
-                                match framed {
-                                    Some(Ok(buf)) => {
-                                        let req: Request = bincode::deserialize(&buf).unwrap();
-                                        info!(req =? req, "Received message");
-                                        req.process(&res_tx, &cloned_puppeter).await;
-                                    }
-                                    Some(Err(err)) => {
-                                        dbg!(err);
-                                    }
-                                    None => break,
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        self.handle = Some(Arc::new(handle));
-        Ok(())
     }
 }
 
@@ -144,15 +98,23 @@ pub enum Request {
         max_stocks: usize,
         min_rsi: Option<f64>,
         max_rsi: Option<f64>,
+        min_dd: Option<f64>,
+        max_dd: Option<f64>,
         min_class: Option<degiro_rs::util::ProductCategory>,
         max_class: Option<degiro_rs::util::ProductCategory>,
         short_sales_constraint: bool,
+        min_roic: Option<f64>,
         roic_wacc_delta: Option<f64>,
     },
     RecalculateSl {
         n: usize,
     },
     GetPortfolio,
+    GetTransactions {
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+    },
+    GetOrders,
     CleanUp,
 }
 
@@ -180,6 +142,12 @@ pub enum Response {
     SendPortfolioSl {
         table: Option<String>,
     },
+    SendTransactions {
+        table: Option<String>,
+    },
+    SendOrders {
+        table: Option<String>,
+    },
     SendCleanUp,
 }
 
@@ -198,15 +166,83 @@ pub enum ServerError {
     EmptyMessage,
 }
 
+#[derive(Debug)]
+pub struct RunServer;
+
 impl Server {
-    pub async fn new(socket: impl Into<SocketAddrV4>) -> Result<Self, tokio::io::Error> {
+    pub async fn new(socket: impl Into<SocketAddrV4> + Send) -> Result<Self, tokio::io::Error> {
         let addr = socket.into();
         let listener = TcpListener::bind(&addr).await?;
         Ok(Self {
             listener: Arc::new(listener),
             addr: addr.to_string(),
-            handle: None,
         })
+    }
+}
+
+#[async_trait]
+impl Handler<RunServer> for Server {
+    type Response = ();
+
+    type Executor = SequentialExecutor;
+
+    async fn handle_message(
+        &mut self,
+        _msg: RunServer,
+        puppeter: &Puppeter,
+    ) -> Result<Self::Response, PuppetError> {
+        info!("Starting server on {}", self.addr);
+        let mut cloned_self = self.clone();
+        let cloned_puppeter = puppeter.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = cloned_self.listener.accept().await else {
+                    let err = PuppetError::critical(cloned_puppeter.pid, "Can't accept connection");
+                    cloned_puppeter
+                        .send_command::<Self>(ServiceCommand::ReportFailure {
+                            pid: cloned_puppeter.pid,
+                            error: err,
+                        })
+                        .await;
+                    break;
+                };
+                let mut frame = Framed::new(socket, LengthDelimitedCodec::new());
+                // TODO:
+                let (res_tx, mut res_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<Option<Response>>();
+                let cloned_puppeter = cloned_puppeter.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            Some(msg) = res_rx.recv() => {
+                                let Ok(bytes) = bincode::serialize(&msg) else {
+                                    return Err(PuppetError::critical(cloned_puppeter.pid, "Can't serialize message"))
+                                };
+                                if frame.send(bytes.into()).await.is_err() {
+                                    return Err(PuppetError::critical(cloned_puppeter.pid, "Can't send message"))
+                                };
+                            }
+                            framed = frame.next() => {
+                                match framed {
+                                    Some(Ok(buf)) => {
+                                        let Ok(req) = bincode::deserialize::<Request>(&buf) else {
+                                            return Err(PuppetError::critical(cloned_puppeter.pid, "Can't deserialize message"))
+                                        };
+                                        info!(req =? req, "Received message");
+                                        req.process(&res_tx, &cloned_puppeter).await;
+                                    }
+                                    Some(Err(err)) => {
+                                        dbg!(err);
+                                    }
+                                    None => break Ok(()),
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Ok(())
     }
 }
 
@@ -266,9 +302,9 @@ impl Request {
         puppeter: &Puppeter,
     ) {
         match self {
-            Request::Ping => todo!(),
-            Request::Pong => todo!(),
-            Request::Authorize => {
+            Self::Ping => todo!(),
+            Self::Pong => todo!(),
+            Self::Authorize => {
                 puppeter
                     .ask::<Degiro, _>(Authorize)
                     .await
@@ -277,14 +313,14 @@ impl Request {
                     });
                 res_tx.send(None).unwrap();
             }
-            Request::FetchData { id } => {
+            Self::FetchData { id } => {
                 let msg = FetchData { id, name: None };
                 puppeter.send::<Degiro, _>(msg).await.unwrap_or_else(|err| {
                     tracing::error!(error = %err, "Failed to fetch data");
                 });
                 res_tx.send(None).unwrap();
             }
-            Request::GetProduct { query } => {
+            Self::GetProduct { query } => {
                 let product = puppeter.ask::<Db, _>(query).await.unwrap_or_else(|err| {
                     tracing::error!(error = %err, "Failed to get product");
                     None
@@ -293,7 +329,7 @@ impl Request {
                     .send(Some(Response::SendProduct { product }))
                     .unwrap();
             }
-            Request::GetFinancials { query } => {
+            Self::GetFinancials { query } => {
                 let financials = puppeter
                     .ask::<Db, _>(FinanclaReportsQuery::from(query))
                     .await
@@ -305,7 +341,7 @@ impl Request {
                     .send(Some(Response::SendFinancials { financials }))
                     .unwrap();
             }
-            Request::GetCandles { query } => {
+            Self::GetCandles { query } => {
                 let candles = puppeter
                     .ask::<Db, _>(CandlesQuery::from(query))
                     .await
@@ -317,7 +353,7 @@ impl Request {
                     .send(Some(Response::SendCandles { candles }))
                     .unwrap();
             }
-            Request::GetSingleAllocation {
+            Self::GetSingleAllocation {
                 query,
                 mode,
                 risk,
@@ -342,7 +378,7 @@ impl Request {
                     }))
                     .unwrap();
             }
-            Request::CalculatePortfolio {
+            Self::CalculatePortfolio {
                 mode,
                 risk,
                 risk_free,
@@ -351,9 +387,12 @@ impl Request {
                 max_stocks,
                 min_rsi,
                 max_rsi,
+                min_dd,
+                max_dd,
                 min_class,
                 max_class,
                 short_sales_constraint,
+                min_roic,
                 roic_wacc_delta,
             } => {
                 let msg = CalculatePortfolio {
@@ -365,9 +404,12 @@ impl Request {
                     max_stocks,
                     min_rsi,
                     max_rsi,
+                    min_dd,
+                    max_dd,
                     min_class,
                     max_class,
                     short_sales_constraint,
+                    min_roic,
                     roic_wacc_delta,
                 };
                 let portfolio = puppeter.ask::<Calculator, _>(msg).await.ok();
@@ -375,21 +417,103 @@ impl Request {
                     .send(Some(Response::SendPortfolio { portfolio }))
                     .unwrap();
             }
-            Request::RecalculateSl { n } => {
+            Self::RecalculateSl { n } => {
                 let msg = CalculateSl { n };
                 let table = puppeter.ask::<Calculator, _>(msg).await.ok();
                 res_tx
                     .send(Some(Response::SendRecalcucatetSl { table }))
                     .unwrap();
             }
-            Request::GetPortfolio => {
+            Self::GetPortfolio => {
                 let msg = GetPortfolio;
                 let portfolio = puppeter.ask::<Calculator, _>(msg).await.ok();
                 res_tx
                     .send(Some(Response::SendPortfolio { portfolio }))
                     .unwrap();
             }
-            Request::CleanUp => {
+            Self::GetTransactions { from_date, to_date } => {
+                let msg = GetTransactions { from_date, to_date };
+                let transactions = puppeter.ask::<Degiro, _>(msg).await.ok();
+                let mut table = comfy_table::Table::new();
+                let header = vec![
+                    comfy_table::Cell::new("id"),
+                    comfy_table::Cell::new("product id"),
+                    comfy_table::Cell::new("transaction type"),
+                    comfy_table::Cell::new("transaction type id"),
+                    comfy_table::Cell::new("order type id"),
+                    comfy_table::Cell::new("price")
+                        .set_alignment(comfy_table::CellAlignment::Right),
+                    comfy_table::Cell::new("total")
+                        .set_alignment(comfy_table::CellAlignment::Right),
+                ];
+                table.set_header(header);
+                table.load_preset(UTF8_BORDERS_ONLY);
+                if let Some(transactions) = transactions {
+                    for transaction in transactions.0 {
+                        table.add_row(vec![
+                            comfy_table::Cell::new(transaction.inner.id.to_string()),
+                            comfy_table::Cell::new(transaction.inner.product_id.to_string()),
+                            comfy_table::Cell::new(transaction.inner.transaction_type.to_string()),
+                            comfy_table::Cell::new(
+                                transaction.inner.transaction_type_id.to_string(),
+                            ),
+                            comfy_table::Cell::new(
+                                transaction
+                                    .inner
+                                    .order_type_id
+                                    .map_or("".to_string(), |id| id.to_string()),
+                            ),
+                            comfy_table::Cell::new(transaction.inner.price.to_string())
+                                .set_alignment(comfy_table::CellAlignment::Right),
+                            comfy_table::Cell::new(transaction.inner.total.to_string())
+                                .set_alignment(comfy_table::CellAlignment::Right),
+                        ]);
+                    }
+                }
+                res_tx
+                    .send(Some(Response::SendTransactions {
+                        table: Some(table.to_string()),
+                    }))
+                    .unwrap();
+            }
+            Self::GetOrders => {
+                let msg = GetOrders;
+                let orders = puppeter.ask::<Degiro, _>(msg).await.ok();
+                let mut table = comfy_table::Table::new();
+                let header = vec![
+                    comfy_table::Cell::new("product id"),
+                    comfy_table::Cell::new("product"),
+                    comfy_table::Cell::new("type"),
+                    comfy_table::Cell::new("qty").set_alignment(comfy_table::CellAlignment::Right),
+                    comfy_table::Cell::new("price")
+                        .set_alignment(comfy_table::CellAlignment::Right),
+                    comfy_table::Cell::new("value")
+                        .set_alignment(comfy_table::CellAlignment::Right),
+                ];
+                table.set_header(header);
+                table.load_preset(UTF8_BORDERS_ONLY);
+                if let Some(orders) = orders {
+                    for order in orders.iter() {
+                        table.add_row(vec![
+                            comfy_table::Cell::new(order.product_id.to_string()),
+                            comfy_table::Cell::new(order.product.to_string()),
+                            comfy_table::Cell::new(order.transaction_type.to_string()),
+                            comfy_table::Cell::new(order.quantity.to_string())
+                                .set_alignment(comfy_table::CellAlignment::Right),
+                            comfy_table::Cell::new(order.stop_price.to_string())
+                                .set_alignment(comfy_table::CellAlignment::Right),
+                            comfy_table::Cell::new(order.total_order_value.to_string())
+                                .set_alignment(comfy_table::CellAlignment::Right),
+                        ]);
+                    }
+                }
+                res_tx
+                    .send(Some(Response::SendOrders {
+                        table: Some(table.to_string()),
+                    }))
+                    .unwrap();
+            }
+            Self::CleanUp => {
                 let msg = CleanUp;
                 puppeter.send::<Db, _>(msg).await.ok();
                 res_tx.send(Some(Response::SendCleanUp)).unwrap();

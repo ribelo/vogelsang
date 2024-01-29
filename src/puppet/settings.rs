@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use config::Config;
-use degiro_rs::{money::Money, util::Period};
 use master_of_puppets::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -16,6 +15,7 @@ pub struct Settings {
 }
 
 impl Settings {
+    #[must_use]
     pub fn new(path: Option<&str>) -> Self {
         let path = path.unwrap_or("Config");
         let settings = Config::builder()
@@ -29,9 +29,9 @@ impl Settings {
             .build()
             .expect("Can't load config");
         let mut settings = settings
-            .try_deserialize::<Settings>()
+            .try_deserialize::<Self>()
             .expect("Can't deserialize config");
-        settings.file_path = Some(path.to_string());
+        settings.file_path = Some(path.to_owned());
         settings
     }
 }

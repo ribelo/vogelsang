@@ -1,7 +1,5 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
-use chrono::Datelike;
-use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, Table};
 use dashmap::DashMap;
 use degiro_rs::{
     api::product::Product,
