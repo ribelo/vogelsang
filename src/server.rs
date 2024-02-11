@@ -55,14 +55,15 @@ impl Lifecycle for Server {
     type Supervision = OneToOne;
 
     async fn reset(&self, puppeter: &Puppeter) -> Result<Self, CriticalError> {
-        let socket: SocketAddrV4 = self
-            .addr
-            .parse()
-            .map_err(|_err| CriticalError::new(puppeter.pid, "Can't parse address"))?;
+        let socket: SocketAddrV4 = self.addr.parse().map_err(|_err| CriticalError {
+            puppet: puppeter.pid,
+            message: "Can't parse address".to_string(),
+        })?;
 
-        Self::new(socket)
-            .await
-            .map_err(|e| CriticalError::new(puppeter.pid, e.to_string()))
+        Self::new(socket).await.map_err(|e| CriticalError {
+            puppet: puppeter.pid,
+            message: e.to_string(),
+        })
     }
 }
 
@@ -192,13 +193,13 @@ impl Handler<RunServer> for Server {
         puppeter: &Puppeter,
     ) -> Result<Self::Response, PuppetError> {
         info!("Starting server on {}", self.addr);
-        let mut cloned_self = self.clone();
+        let cloned_self = self.clone();
         let cloned_puppeter = puppeter.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = cloned_self.listener.accept().await else {
-                    let err = PuppetError::critical(cloned_puppeter.pid, "Can't accept connection");
-                    cloned_puppeter
+                    let err = cloned_puppeter.critical_error("Can't accept connection");
+                    let _ = cloned_puppeter
                         .send_command::<Self>(ServiceCommand::ReportFailure {
                             pid: cloned_puppeter.pid,
                             error: err,
@@ -216,17 +217,17 @@ impl Handler<RunServer> for Server {
                         tokio::select! {
                             Some(msg) = res_rx.recv() => {
                                 let Ok(bytes) = bincode::serialize(&msg) else {
-                                    return Err(PuppetError::critical(cloned_puppeter.pid, "Can't serialize message"))
+                                    return Err(cloned_puppeter.critical_error("Can't serialize message"))
                                 };
                                 if frame.send(bytes.into()).await.is_err() {
-                                    return Err(PuppetError::critical(cloned_puppeter.pid, "Can't send message"))
+                                    return Err(cloned_puppeter.critical_error( "Can't send message"))
                                 };
                             }
                             framed = frame.next() => {
                                 match framed {
                                     Some(Ok(buf)) => {
                                         let Ok(req) = bincode::deserialize::<Request>(&buf) else {
-                                            return Err(PuppetError::critical(cloned_puppeter.pid, "Can't deserialize message"))
+                                            return Err(cloned_puppeter.critical_error("Can't deserialize message"))
                                         };
                                         info!(req =? req, "Received message");
                                         req.process(&res_tx, &cloned_puppeter).await;

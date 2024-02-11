@@ -73,7 +73,7 @@ impl Handler<GetSingleAllocation> for Calculator {
                 .await
                 .map_err(|e| {
                     error!(error = %e, "Failed to calculate single allocation");
-                    CriticalError::new(puppeter.pid, e.to_string())
+                    puppeter.critical_error(&e)
                 })?;
             Ok(Some(allocation))
         } else {
@@ -575,16 +575,10 @@ impl Handler<CalculateSl> for Calculator {
                 if let Some(avg_dd) = candles.average_drawdown(12) {
                     if let Some(Some(avg_dd_value)) = avg_dd.values.last() {
                         let Some(last_price) = candles.close.last() else {
-                            return Err(PuppetError::critical(
-                                puppeter.pid,
-                                "Failed to get last price",
-                            ));
+                            return Err(puppeter.critical_error("Failed to get last price"));
                         };
                         let Some(last_time) = candles.time.last() else {
-                            return Err(PuppetError::critical(
-                                puppeter.pid,
-                                "Failed to get last time",
-                            ));
+                            return Err(puppeter.critical_error("Failed to get last time"));
                         };
                         let new_stop = last_price * (1.0 - avg_dd_value * msg.n as f64);
                         table.add_row(vec![

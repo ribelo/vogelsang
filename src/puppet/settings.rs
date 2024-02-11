@@ -55,13 +55,13 @@ impl Handler<SaveSettings> for Settings {
     async fn handle_message(
         &mut self,
         _msg: SaveSettings,
-        _puppeter: &Puppeter,
+        puppeter: &Puppeter,
     ) -> Result<Self::Response, PuppetError> {
         let path = format!("{}.toml", self.file_path.as_ref().unwrap());
         let toml = toml::to_string_pretty(self).unwrap();
         tokio::fs::write(&path, toml).await.map_err(|e| {
             error!("Can't save config: {}", e);
-            CriticalError::new(_puppeter.pid, e.to_string())
+            puppeter.critical_error(&e)
         })?;
         info!("Saved config to {}", path);
         Ok(())

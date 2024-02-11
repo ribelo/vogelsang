@@ -43,10 +43,13 @@ impl Degiro {
 impl Lifecycle for Degiro {
     type Supervision = OneToOne;
 
-    async fn reset(&self, _puppeter: &Puppeter) -> Result<Self, CriticalError> {
+    async fn reset(&self, puppeter: &Puppeter) -> Result<Self, CriticalError> {
         Self::new(&self.username, &self.password).map_err(|e| {
             error!("Failed to reset handler: {}", e);
-            CriticalError::new(Pid::new::<Self>(), e.to_string())
+            CriticalError {
+                puppet: puppeter.pid,
+                message: e.to_string(),
+            }
         })
     }
 }
@@ -68,7 +71,7 @@ impl Handler<Authorize> for Degiro {
         info!("Authorizing...");
         self.client.authorize().await.map_err(|e| {
             error!("Failed to authorize: {}", e);
-            PuppetError::Critical(CriticalError::new(puppeter.pid, e.to_string()))
+            puppeter.critical_error(&e)
         })?;
 
         info!("Successfully authorized.");
@@ -107,21 +110,21 @@ impl Handler<FetchData> for Degiro {
                         .await
                         .map_err(|e| {
                             error!(error = %e, id = %id, asset_name = %asset_name, "Failed to send 'put product'");
-                            PuppetError::critical(puppeter.pid, e)
+                            puppeter.critical_error(&e)
                         })?;
                 }
                 Err(e @ ClientError::Unauthorized) => {
                     warn!(id = %id, asset_name = %asset_name, "Handler unauthorized, attempting authorization...");
                     puppeter.ask::<Self, _>(Authorize).await.map_err(|e| {
                         error!(error = %e, "Failed to authorize");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                     puppeter.send::<Self, _>(msg.clone()).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to resend message");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
 
-                    return Err(PuppetError::non_critical(puppeter.pid, e));
+                    return Err(puppeter.critical_error(&e));
                 }
                 Err(e) => {
                     error!(error = %e, id = %id, asset_name = %asset_name, "Failed to fetch product data")
@@ -133,7 +136,7 @@ impl Handler<FetchData> for Degiro {
                     info!(id = %id, asset_name = %asset_name, "Fetched {} candles", quotes.time.len());
                     puppeter.send::<Db, _>(quotes.clone()).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to send 'put candles'");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                 }
                 Err(e) => {
@@ -141,11 +144,11 @@ impl Handler<FetchData> for Degiro {
                     warn!(id = %id, asset_name = %asset_name, "Removing asset from settings and database");
                     puppeter.ask::<Settings, _>(DeleteAsset(id.clone())).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to remove asset from settings");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                     puppeter.ask::<Db, _>(DeleteData(id.clone())).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to delete asset from database");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                 }
             }
@@ -157,7 +160,7 @@ impl Handler<FetchData> for Degiro {
                         .await
                         .map_err(|e| {
                             error!(error = %e, id = %id, asset_name = %asset_name, "Failed to send 'put financial reports'");
-                            PuppetError::critical(puppeter.pid, e)
+                            puppeter.critical_error(&e)
                         })?;
                 }
                 Err(e) => {
@@ -165,11 +168,11 @@ impl Handler<FetchData> for Degiro {
                     warn!(id = %id, asset_name = %asset_name, "Removing asset from settings and database");
                     puppeter.ask::<Settings, _>(DeleteAsset(id.clone())).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to remove asset from settings");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                     puppeter.ask::<Db, _>(DeleteData(id.clone())).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to delete asset from database");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                 }
             }
@@ -178,7 +181,7 @@ impl Handler<FetchData> for Degiro {
                 Ok(company_ratios) => {
                     puppeter.send::<Db, _>(company_ratios).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to send 'put company ratios'");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                 }
                 Err(e) => {
@@ -186,11 +189,11 @@ impl Handler<FetchData> for Degiro {
                     warn!(id = %id, asset_name = %asset_name, "Removing asset from settings and database");
                     puppeter.ask::<Settings, _>(DeleteAsset(id.clone())).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to remove asset from settings");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                     puppeter.ask::<Db, _>(DeleteData(id.clone())).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to delete asset from database");
-                        PuppetError::critical(puppeter.pid, e)
+                        puppeter.critical_error(&e)
                     })?;
                 }
             }
@@ -198,14 +201,14 @@ impl Handler<FetchData> for Degiro {
             info!("Fetching data for all assets");
             puppeter.ask::<Self, _>(Authorize).await.map_err(|e| {
                 error!(error = %e, "Failed to authorize");
-                PuppetError::critical(puppeter.pid, e)
+                puppeter.critical_error(&e)
             })?;
             let settings = puppeter
                 .ask::<Settings, _>(GetSettings)
                 .await
                 .map_err(|e| {
                     error!(error = %e, "Failed to get settings");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })?;
             for (id, name) in settings.assets.iter() {
                 let msg = FetchData {
@@ -214,7 +217,7 @@ impl Handler<FetchData> for Degiro {
                 };
                 puppeter.send::<Self, _>(msg).await.map_err(|e| {
                     error!(error = %e, id = %id, "Failed to resend message");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })?;
             }
             info!("Finished fetching data for all assets");
@@ -244,16 +247,16 @@ impl Handler<GetPortfolio> for Degiro {
                 warn!("Handler unauthorized, attempting authorization...");
                 puppeter.ask::<Self, _>(Authorize).await.map_err(|e| {
                     error!(error = %e, "Failed to authorize");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })?;
                 puppeter.ask::<Self, _>(msg.clone()).await.map_err(|e| {
                     error!(error = %e, "Failed to resend message");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })
             }
             Err(e) => {
                 error!(error = %e, "Failed to fetch portfolio: {}", e);
-                Err(PuppetError::critical(puppeter.pid, e))
+                Err(puppeter.critical_error(&e))
             }
         }
     }
@@ -283,16 +286,16 @@ impl Handler<GetTransactions> for Degiro {
                 warn!("Handler unauthorized, attempting authorization...");
                 puppeter.ask::<Self, _>(Authorize).await.map_err(|e| {
                     error!(error = %e, "Failed to authorize");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })?;
                 puppeter.ask::<Self, _>(msg.clone()).await.map_err(|e| {
                     error!(error = %e, "Failed to resend message");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })
             }
             Err(e) => {
                 error!(error = %e, "Failed to fetch transactions: {}", e);
-                Err(PuppetError::critical(puppeter.pid, e))
+                Err(puppeter.critical_error(&e))
             }
         }
     }
@@ -319,16 +322,16 @@ impl Handler<GetOrders> for Degiro {
                 warn!("Handler unauthorized, attempting authorization...");
                 puppeter.ask::<Self, _>(Authorize).await.map_err(|e| {
                     error!(error = %e, "Failed to authorize");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })?;
                 puppeter.ask::<Self, _>(msg).await.map_err(|e| {
                     error!(error = %e, "Failed to resend message");
-                    PuppetError::critical(puppeter.pid, e)
+                    puppeter.critical_error(&e)
                 })
             }
             Err(e) => {
                 error!(error = %e, "Failed to fetch transactions: {}", e);
-                Err(PuppetError::critical(puppeter.pid, e))
+                Err(puppeter.critical_error(&e))
             }
         }
     }
