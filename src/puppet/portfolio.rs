@@ -1,11 +1,11 @@
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Datelike;
 use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, Table};
 use dashmap::DashMap;
 use degiro_rs::{
-    api::product::{Product, ProductDetails},
+    api::product::ProductDetails,
     util::{Period, ProductCategory, TransactionType},
 };
 use erfurt::candle::{Candles, CandlesExt};
@@ -218,7 +218,7 @@ impl Handler<CalculatePortfolio> for Calculator {
         puppeter: &Puppeter,
     ) -> Result<Self::Response, PuppetError> {
         let data = DashMap::new();
-        for (id, _) in self.settings.assets.iter() {
+        for (id, _) in &self.settings.assets {
             let get_data_entry = GetDataEntry {
                 id: id.clone(),
                 risk: msg.risk,
@@ -234,7 +234,7 @@ impl Handler<CalculatePortfolio> for Calculator {
             risk: msg.risk,
             risk_free: msg.risk_free,
             money: msg.money,
-            max_stock: msg.max_stocks as i32,
+            max_stock: i32::try_from(msg.max_stocks).expect("Failed to convert max_stocks"),
             min_rsi: msg.min_rsi,
             max_rsi: msg.max_rsi,
             min_dd: msg.min_dd,
@@ -244,7 +244,7 @@ impl Handler<CalculatePortfolio> for Calculator {
             roic_wacc_delta: msg.roic_wacc_delta,
             data: Arc::new(data),
         };
-        portfolio_calculator.remove_invalid().calculate().await;
+        portfolio_calculator.remove_invalid().calculate();
         Ok(portfolio_calculator.as_table().to_string())
     }
 }
@@ -275,7 +275,7 @@ impl PortfolioCalculator {
         let max_time_month = self
             .data
             .iter()
-            .filter_map(|entry| entry.value().candles.time.last().cloned())
+            .filter_map(|entry| entry.value().candles.time.last().copied())
             .max()
             .unwrap()
             .month();
@@ -311,7 +311,7 @@ impl PortfolioCalculator {
 
                 if *rsi < min_rsi_value || *rsi > max_rsi_value {
                     println!("RSI is out of range for {} : {}", id, product.name);
-                    println!("Should be: {} < {} < {}", min_rsi_value, rsi, max_rsi_value);
+                    println!("Should be: {min_rsi_value} < {rsi} < {max_rsi_value}");
                     to_remove.insert(id.clone());
                 }
             }
@@ -325,14 +325,14 @@ impl PortfolioCalculator {
             if let Some(min_dd) = self.min_dd {
                 if *redp < min_dd {
                     println!("Min DD is out of range for {} : {}", id, product.name);
-                    println!("Should be: {} < {}", redp, min_dd);
+                    println!("Should be: {redp} < {min_dd}");
                     to_remove.insert(id.clone());
                 }
             }
             if let Some(max_dd) = self.max_dd {
                 if *redp > max_dd {
                     println!("Max DD is out of range for {} : {}", id, product.name);
-                    println!("Should be: {} > {}", redp, max_dd);
+                    println!("Should be: {redp} > {max_dd}");
                     to_remove.insert(id.clone());
                 }
             }
@@ -377,12 +377,10 @@ impl PortfolioCalculator {
         }
     }
 
-    pub async fn calculate(&self) {
+    pub fn calculate(&self) {
         let mut retry = 0;
         'outer: loop {
-            if retry > 5 {
-                panic!("Too many retries");
-            }
+            assert!(retry <= 5, "Too many retries");
             let stocks = self
                 .data
                 .iter()
@@ -396,17 +394,14 @@ impl PortfolioCalculator {
                 .collect_vec();
 
             let seq = AssetsSeq(stocks);
-            let Ok(mut allocations) = seq
-                .redp_multiple_allocation(
-                    self.mode,
-                    self.risk,
-                    self.risk_free,
-                    Period::P1Y,
-                    Period::P1M,
-                    self.short_sales_constraint,
-                )
-                .await
-            else {
+            let Ok(mut allocations) = seq.redp_multiple_allocation(
+                self.mode,
+                self.risk,
+                self.risk_free,
+                Period::P1Y,
+                Period::P1M,
+                self.short_sales_constraint,
+            ) else {
                 retry += 1;
                 self.remove_worst();
                 continue 'outer;
@@ -419,7 +414,7 @@ impl PortfolioCalculator {
                 continue 'outer;
             };
 
-            for (p, allocation) in allocations.iter() {
+            for (p, allocation) in &allocations {
                 let cash = self.money * allocation.abs();
                 if cash < p.close_price {
                     self.blacklist(&p.id);
@@ -505,17 +500,17 @@ impl PortfolioCalculator {
                     product.name.chars().take(24).collect::<String>()
                 )),
                 Cell::new(product.symbol.clone()),
-                Cell::new(format!("{:.2}", redp_allocation)),
-                Cell::new(format!("{:.2}", cash)),
+                Cell::new(format!("{redp_allocation:.2}")),
+                Cell::new(format!("{cash:.2}")),
                 Cell::new(qty.to_string()),
                 Cell::new(format!("{:.2}", product.close_price)),
-                Cell::new(format!("{:.2}", stop_loss)),
-                Cell::new(format!("{:.2}", sharpe_ratio)),
-                Cell::new(format!("{:.2}", avg_dd)),
-                Cell::new(format!("{:.2}", roic)),
-                Cell::new(format!("{:.2}", wacc)),
-                Cell::new(format!("{:.2}", rsi)),
-                Cell::new(format!("{:.2}", redp)),
+                Cell::new(format!("{stop_loss:.2}")),
+                Cell::new(format!("{sharpe_ratio:.2}")),
+                Cell::new(format!("{avg_dd:.2}")),
+                Cell::new(format!("{roic:.2}")),
+                Cell::new(format!("{wacc:.2}")),
+                Cell::new(format!("{rsi:.2}")),
+                Cell::new(format!("{redp:.2}")),
             ]);
         }
 
@@ -525,7 +520,8 @@ impl PortfolioCalculator {
 
 #[derive(Debug, Clone)]
 pub struct CalculateSl {
-    pub n: usize,
+    pub nstd: usize,
+    pub max_percent: Option<f64>,
 }
 
 #[async_trait]
@@ -551,10 +547,11 @@ impl Handler<CalculateSl> for Calculator {
             comfy_table::Cell::new("price"),
             comfy_table::Cell::new("avg dd").set_alignment(comfy_table::CellAlignment::Right),
             comfy_table::Cell::new("stop loss").set_alignment(comfy_table::CellAlignment::Right),
+            comfy_table::Cell::new("percentage").set_alignment(comfy_table::CellAlignment::Right),
         ];
         table.set_header(header);
         table.load_preset(UTF8_BORDERS_ONLY);
-        for position in portfolio.0.iter() {
+        for position in &portfolio.0 {
             let Ok(product_id) = position.inner.id.parse::<u64>() else {
                 continue;
             };
@@ -580,7 +577,10 @@ impl Handler<CalculateSl> for Calculator {
                         let Some(last_time) = candles.time.last() else {
                             return Err(puppeter.critical_error("Failed to get last time"));
                         };
-                        let new_stop = last_price * (1.0 - avg_dd_value * msg.n as f64);
+                        let std_stop = last_price * (1.0 - avg_dd_value * msg.nstd as f64);
+                        let min_stop = last_price * (1.0 - msg.max_percent.unwrap_or(1.0));
+                        let new_stop = std_stop.max(min_stop);
+                        let percentage = (new_stop - last_price) / last_price * 100.0;
                         table.add_row(vec![
                             comfy_table::Cell::new(product.id.clone()),
                             comfy_table::Cell::new(format!(
@@ -591,23 +591,23 @@ impl Handler<CalculateSl> for Calculator {
                             comfy_table::Cell::new(last_time.to_string()),
                             comfy_table::Cell::new(last_price)
                                 .set_alignment(comfy_table::CellAlignment::Right),
-                            comfy_table::Cell::new(format!("{:.2}", avg_dd_value))
+                            comfy_table::Cell::new(format!("{avg_dd_value:.2}"))
                                 .set_alignment(comfy_table::CellAlignment::Right),
                             match (new_stop, old_sl) {
-                                (new_sl, None) => comfy_table::Cell::new(format!("{:.2}", new_sl))
+                                (new_sl, None) => comfy_table::Cell::new(format!("{new_sl:.2}"))
                                     .set_alignment(comfy_table::CellAlignment::Right)
                                     .fg(comfy_table::Color::Red),
                                 (new_sl, Some(old_sl)) if old_sl >= new_sl => {
-                                    comfy_table::Cell::new(format!("{:.2}", new_sl))
+                                    comfy_table::Cell::new(format!("{new_sl:.2}"))
                                         .set_alignment(comfy_table::CellAlignment::Right)
                                         .fg(comfy_table::Color::Yellow)
                                 }
-                                (new_sl, Some(_)) => {
-                                    comfy_table::Cell::new(format!("{:.2}", new_sl))
-                                        .set_alignment(comfy_table::CellAlignment::Right)
-                                        .fg(comfy_table::Color::Green)
-                                }
+                                (new_sl, Some(_)) => comfy_table::Cell::new(format!("{new_sl:.2}"))
+                                    .set_alignment(comfy_table::CellAlignment::Right)
+                                    .fg(comfy_table::Color::Green),
                             },
+                            comfy_table::Cell::new(format!("{percentage:.2}"))
+                                .set_alignment(comfy_table::CellAlignment::Right),
                         ]);
                     }
                 }
@@ -646,7 +646,7 @@ impl Handler<GetPortfolio> for Calculator {
         ];
         table.set_header(header);
         table.load_preset(UTF8_BORDERS_ONLY);
-        for position in portfolio.0.iter() {
+        for position in &portfolio.0 {
             if position.inner.size <= 0.0 {
                 continue;
             }
@@ -695,11 +695,11 @@ impl Handler<GetPortfolio> for Calculator {
                         let capm = annual_report.capm_equity_cost(0.2, 0.05, beta);
                         let wacc = annual_report.wacc(capm);
                         row.push(
-                            Cell::new(format!("{:.2}", roic))
+                            Cell::new(format!("{roic:.2}"))
                                 .set_alignment(comfy_table::CellAlignment::Right),
                         );
                         row.push(
-                            Cell::new(format!("{:.2}", wacc))
+                            Cell::new(format!("{wacc:.2}"))
                                 .set_alignment(comfy_table::CellAlignment::Right),
                         );
                     }
