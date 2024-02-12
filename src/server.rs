@@ -6,9 +6,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDate};
 use comfy_table::presets::UTF8_BORDERS_ONLY;
-use degiro_rs::api::{
-    financial_statements::FinancialReports, product::ProductDetails, transactions::Transactions,
-};
+use degiro_rs::api::{financial_statements::FinancialReports, product::ProductDetails};
 use erfurt::prelude::Candles;
 use futures::SinkExt;
 use master_of_puppets::{
@@ -16,10 +14,7 @@ use master_of_puppets::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task::JoinHandle,
-};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{error, info};
@@ -69,8 +64,6 @@ impl Lifecycle for Server {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Request {
-    Ping,
-    Pong,
     Authorize,
     FetchData {
         id: Option<String>,
@@ -108,7 +101,8 @@ pub enum Request {
         roic_wacc_delta: Option<f64>,
     },
     RecalculateSl {
-        n: usize,
+        nstd: usize,
+        max_percent: Option<f64>,
     },
     GetPortfolio,
     GetTransactions {
@@ -171,7 +165,7 @@ pub enum ServerError {
 pub struct RunServer;
 
 impl Server {
-    pub async fn new(socket: impl Into<SocketAddrV4> + Send) -> Result<Self, tokio::io::Error> {
+    pub async fn new<T: Into<SocketAddrV4> + Send>(socket: T) -> Result<Self, tokio::io::Error> {
         let addr = socket.into();
         let listener = TcpListener::bind(&addr).await?;
         Ok(Self {
@@ -233,7 +227,7 @@ impl Handler<RunServer> for Server {
                                         req.process(&res_tx, &cloned_puppeter).await;
                                     }
                                     Some(Err(err)) => {
-                                        dbg!(err);
+                                        eprintln!("{err}");
                                     }
                                     None => break Ok(()),
                                 }
@@ -248,7 +242,7 @@ impl Handler<RunServer> for Server {
 }
 
 impl ClientBuilder {
-    pub fn new(socket: impl Into<SocketAddrV4>) -> Self {
+    pub fn new<T: Into<SocketAddrV4>>(socket: T) -> Self {
         let addr = socket.into();
         Self { addr: addr.into() }
     }
@@ -265,7 +259,7 @@ impl Client {
     pub async fn read(&mut self) -> Option<Response> {
         match tokio::time::timeout(Duration::seconds(60).to_std().unwrap(), self.frame.next()).await
         {
-            Err(_) | Ok(None) | Ok(Some(Err(_))) => None,
+            Err(_) | Ok(None | Some(Err(_))) => None,
             Ok(Some(Ok(buf))) => bincode::deserialize::<Option<Response>>(&buf).unwrap(),
         }
     }
@@ -303,8 +297,6 @@ impl Request {
         puppeter: &Puppeter,
     ) {
         match self {
-            Self::Ping => todo!(),
-            Self::Pong => todo!(),
             Self::Authorize => {
                 puppeter
                     .ask::<Degiro, _>(Authorize)
@@ -418,8 +410,8 @@ impl Request {
                     .send(Some(Response::SendPortfolio { portfolio }))
                     .unwrap();
             }
-            Self::RecalculateSl { n } => {
-                let msg = CalculateSl { n };
+            Self::RecalculateSl { nstd, max_percent } => {
+                let msg = CalculateSl { nstd, max_percent };
                 let table = puppeter.ask::<Calculator, _>(msg).await.ok();
                 res_tx
                     .send(Some(Response::SendRecalcucatetSl { table }))
@@ -462,7 +454,7 @@ impl Request {
                                 transaction
                                     .inner
                                     .order_type_id
-                                    .map_or("".to_string(), |id| id.to_string()),
+                                    .map_or(String::new(), |id| id.to_string()),
                             ),
                             comfy_table::Cell::new(transaction.inner.price.to_string())
                                 .set_alignment(comfy_table::CellAlignment::Right),
