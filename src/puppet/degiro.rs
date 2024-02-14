@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use degiro_rs::{
     api::{orders::Orders, portfolio::Portfolio, transactions::Transactions},
     client::{Client, ClientBuilder, ClientError},
@@ -23,9 +23,9 @@ pub struct Degiro {
 }
 
 impl Degiro {
-    pub fn new(
-        username: impl AsRef<str>,
-        password: impl AsRef<str>,
+    pub fn new<U: AsRef<str>, P: AsRef<str>>(
+        username: U,
+        password: P,
     ) -> Result<Self, reqwest::Error> {
         let client = ClientBuilder::default()
             .username(username.as_ref())
@@ -127,7 +127,7 @@ impl Handler<FetchData> for Degiro {
                     return Err(puppeter.critical_error(&e));
                 }
                 Err(e) => {
-                    error!(error = %e, id = %id, asset_name = %asset_name, "Failed to fetch product data")
+                    error!(error = %e, id = %id, asset_name = %asset_name, "Failed to fetch product data");
                 }
             };
 
@@ -179,7 +179,7 @@ impl Handler<FetchData> for Degiro {
 
             match self.client.company_ratios(id, &isin).await {
                 Ok(company_ratios) => {
-                    puppeter.send::<Db, _>(company_ratios).await.map_err(|e| {
+                    let () = Box::pin(puppeter.send::<Db, _>(company_ratios)).await.map_err(|e| {
                         error!(error = %e, id = %id, asset_name = %asset_name, "Failed to send 'put company ratios'");
                         puppeter.critical_error(&e)
                     })?;
@@ -210,7 +210,7 @@ impl Handler<FetchData> for Degiro {
                     error!(error = %e, "Failed to get settings");
                     puppeter.critical_error(&e)
                 })?;
-            for (id, name) in settings.assets.iter() {
+            for (id, name) in &settings.assets {
                 let msg = FetchData {
                     id: Some(id.to_string()),
                     name: Some(name.clone()),

@@ -1,8 +1,11 @@
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_sign_loss)]
+
 use anyhow::Result;
 use tracing::info;
 
 pub mod cli;
-pub mod cmd;
 pub mod portfolio;
 pub mod puppet;
 pub mod server;

@@ -111,8 +111,10 @@ pub enum Commands {
         roic_wacc_delta: Option<f64>,
     },
     RecalculateSl {
-        #[clap(short, default_value = "2")]
-        n: usize,
+        #[clap(short, long, default_value = "3")]
+        nstd: usize,
+        #[clap(short, long)]
+        max_percent: Option<f64>,
     },
     GetTransactions {
         #[clap(short, long)]
@@ -134,150 +136,165 @@ impl CliExt for App {
     async fn run(self) -> Result<()> {
         let cli = Cli::parse();
         let port = cli.port;
-        match cli.command {
-            Some(cmd) => {
-                let addr = Ipv4Addr::new(127, 0, 0, 1);
-                let socket = SocketAddrV4::new(addr, port);
-                let mut client = ClientBuilder::new(socket).build().await.unwrap();
-                match cmd {
-                    Commands::Authorize {} => {
-                        info!("Authorizing...");
-                        let msg = server::Request::Authorize {};
-                        client.write(msg).await.or_else(|| {
-                            warn!("No response");
-                            None
-                        });
-                    }
-                    Commands::FetchData { id } => {
-                        let msg = server::Request::FetchData { id };
-                        client.write(msg).await.or_else(|| {
-                            warn!("No response");
-                            None
-                        });
-                    }
-                    Commands::GetProduct { id, symbol, name } => {
-                        let query = if let Some(id) = id {
-                            ProductQuery::Id(id.clone())
-                        } else if let Some(symbol) = symbol {
-                            ProductQuery::Symbol(symbol.clone())
-                        } else if let Some(name) = name {
-                            ProductQuery::Name(name.clone())
-                        } else {
-                            panic!("No valid argument provided for GetProduct");
-                        };
-                        let msg = server::Request::GetProduct { query };
-                        match client.write(msg).await {
-                            Some(Response::SendProduct { product }) => {
-                                if let Some(product) = product {
-                                    println!("{}", product);
-                                } else {
-                                    println!("No product found");
-                                }
+        if let Some(cmd) = cli.command {
+            let addr = Ipv4Addr::new(127, 0, 0, 1);
+            let socket = SocketAddrV4::new(addr, port);
+            let mut client = ClientBuilder::new(socket).build().await.unwrap();
+            match cmd {
+                Commands::Authorize {} => {
+                    info!("Authorizing...");
+                    let msg = server::Request::Authorize {};
+                    client.write(msg).await.or_else(|| {
+                        warn!("No response");
+                        None
+                    });
+                }
+                Commands::FetchData { id } => {
+                    let msg = server::Request::FetchData { id };
+                    client.write(msg).await.or_else(|| {
+                        warn!("No response");
+                        None
+                    });
+                }
+                Commands::GetProduct { id, symbol, name } => {
+                    let query = if let Some(id) = id {
+                        ProductQuery::Id(id.clone())
+                    } else if let Some(symbol) = symbol {
+                        ProductQuery::Symbol(symbol.clone())
+                    } else if let Some(name) = name {
+                        ProductQuery::Name(name.clone())
+                    } else {
+                        panic!("No valid argument provided for GetProduct");
+                    };
+                    let msg = server::Request::GetProduct { query };
+                    match client.write(msg).await {
+                        Some(Response::SendProduct { product }) => {
+                            if let Some(product) = product {
+                                println!("{product}");
+                            } else {
+                                println!("No product found");
                             }
-                            Some(res) => error!(res = ?res, "Unexpected response"),
-                            None => warn!("No response"),
-                        };
-                    }
-                    Commands::GetFinancials { id, symbol, name } => {
-                        let query = if let Some(id) = id {
-                            ProductQuery::Id(id.clone())
-                        } else if let Some(symbol) = symbol {
-                            ProductQuery::Symbol(symbol.clone())
-                        } else if let Some(name) = name {
-                            ProductQuery::Name(name.clone())
-                        } else {
-                            panic!("No valid argument provided for GetProduct");
-                        };
-                        let msg = server::Request::GetFinancials { query };
-                        match client.write(msg).await {
-                            Some(Response::SendFinancials { financials }) => {
-                                if let Some(financials) = financials {
-                                    println!("{:#?}", financials);
-                                } else {
-                                    println!("No financials found");
-                                }
-                            }
-                            _ => warn!("Unexpected response"),
                         }
-                    }
-                    Commands::GetCandles { id, symbol, name } => {
-                        let query = if let Some(id) = id {
-                            ProductQuery::Id(id.clone())
-                        } else if let Some(symbol) = symbol {
-                            ProductQuery::Symbol(symbol.clone())
-                        } else if let Some(name) = name {
-                            ProductQuery::Name(name.clone())
+                        Some(res) => error!(res = ?res, "Unexpected response"),
+                        None => warn!("No response"),
+                    };
+                }
+                Commands::GetFinancials { id, symbol, name } => {
+                    let query = if let Some(id) = id {
+                        ProductQuery::Id(id.clone())
+                    } else if let Some(symbol) = symbol {
+                        ProductQuery::Symbol(symbol.clone())
+                    } else if let Some(name) = name {
+                        ProductQuery::Name(name.clone())
+                    } else {
+                        panic!("No valid argument provided for GetProduct");
+                    };
+                    let msg = server::Request::GetFinancials { query };
+                    if let Some(Response::SendFinancials { financials }) = client.write(msg).await {
+                        if let Some(financials) = financials {
+                            println!("{financials:#?}");
                         } else {
-                            panic!("No valid argument provided for GetProduct");
-                        };
-                        let msg = server::Request::GetCandles { query };
-                        client.write(msg).await.or_else(|| {
-                            warn!("No response");
-                            None
-                        });
+                            println!("No financials found");
+                        }
+                    } else {
+                        warn!("Unexpected response");
                     }
-                    Commands::GetSingleAllocation {
-                        id,
+                }
+                Commands::GetCandles { id, symbol, name } => {
+                    let query = if let Some(id) = id {
+                        ProductQuery::Id(id.clone())
+                    } else if let Some(symbol) = symbol {
+                        ProductQuery::Symbol(symbol.clone())
+                    } else if let Some(name) = name {
+                        ProductQuery::Name(name.clone())
+                    } else {
+                        panic!("No valid argument provided for GetProduct");
+                    };
+                    let msg = server::Request::GetCandles { query };
+                    client.write(msg).await.or_else(|| {
+                        warn!("No response");
+                        None
+                    });
+                }
+                Commands::GetSingleAllocation {
+                    id,
+                    mode,
+                    risk,
+                    risk_free,
+                    symbol,
+                    name,
+                } => {
+                    let query = id.map_or_else(
+                        || {
+                            symbol.map_or_else(
+                                || {
+                                    name.map_or_else(
+                                        || {
+                                            panic!("No valid argument provided for GetProduct");
+                                        },
+                                        ProductQuery::Name,
+                                    )
+                                },
+                                ProductQuery::Symbol,
+                            )
+                        },
+                        ProductQuery::Id,
+                    );
+                    let msg = server::Request::GetSingleAllocation {
+                        query,
                         mode,
                         risk,
                         risk_free,
-                        symbol,
-                        name,
-                    } => {
-                        let query = id.map_or_else(
-                            || {
-                                symbol.map_or_else(
-                                    || {
-                                        name.map_or_else(
-                                            || {
-                                                panic!("No valid argument provided for GetProduct");
-                                            },
-                                            ProductQuery::Name,
-                                        )
-                                    },
-                                    ProductQuery::Symbol,
-                                )
-                            },
-                            ProductQuery::Id,
-                        );
-                        let msg = server::Request::GetSingleAllocation {
-                            query,
-                            mode,
-                            risk,
-                            risk_free,
-                        };
-                        client.write(msg).await.or_else(|| {
-                            warn!("No response");
-                            None
-                        });
-                    }
-                    Commands::GetPortfolio => {
-                        let msg = server::Request::GetPortfolio {};
-                        match client.write(msg).await {
-                            Some(Response::SendPortfolio { portfolio }) => {
-                                if let Some(portfolio) = portfolio {
-                                    println!("{}", portfolio);
-                                } else {
-                                    println!("No portfolio calculated");
-                                }
+                    };
+                    client.write(msg).await.or_else(|| {
+                        warn!("No response");
+                        None
+                    });
+                }
+                Commands::GetPortfolio => {
+                    let msg = server::Request::GetPortfolio {};
+                    match client.write(msg).await {
+                        Some(Response::SendPortfolio { portfolio }) => {
+                            if let Some(portfolio) = portfolio {
+                                println!("{portfolio}");
+                            } else {
+                                println!("No portfolio calculated");
                             }
-                            Some(_) => error!("Unexpected response"),
-                            None => warn!("No response"),
                         }
+                        Some(_) => error!("Unexpected response"),
+                        None => warn!("No response"),
                     }
-                    Commands::RecalculateSl { n } => {
-                        let msg = server::Request::RecalculateSl { n };
-                        match client.write(msg).await {
-                            Some(Response::SendRecalcucatetSl { table }) => {
-                                if let Some(table) = table {
-                                    println!("{}", table);
-                                }
+                }
+                Commands::RecalculateSl { nstd, max_percent } => {
+                    let msg = server::Request::RecalculateSl { nstd, max_percent };
+                    match client.write(msg).await {
+                        Some(Response::SendRecalcucatetSl { table }) => {
+                            if let Some(table) = table {
+                                println!("{table}");
                             }
-                            Some(_) => error!("Unexpected response"),
-                            None => warn!("No response"),
                         }
+                        Some(_) => error!("Unexpected response"),
+                        None => warn!("No response"),
                     }
-                    Commands::CalculatePortfolio {
+                }
+                Commands::CalculatePortfolio {
+                    mode,
+                    risk,
+                    risk_free,
+                    freq,
+                    money,
+                    max_stocks,
+                    min_rsi,
+                    max_rsi,
+                    min_dd,
+                    max_dd,
+                    min_class,
+                    max_class,
+                    short_sales_constraint,
+                    min_roic,
+                    roic_wacc_delta,
+                } => {
+                    let req = server::Request::CalculatePortfolio {
                         mode,
                         risk,
                         risk_free,
@@ -293,104 +310,84 @@ impl CliExt for App {
                         short_sales_constraint,
                         min_roic,
                         roic_wacc_delta,
-                    } => {
-                        let req = server::Request::CalculatePortfolio {
-                            mode,
-                            risk,
-                            risk_free,
-                            freq,
-                            money,
-                            max_stocks,
-                            min_rsi,
-                            max_rsi,
-                            min_dd,
-                            max_dd,
-                            min_class,
-                            max_class,
-                            short_sales_constraint,
-                            min_roic,
-                            roic_wacc_delta,
-                        };
-                        match client.write(req).await {
-                            Some(Response::SendPortfolio { portfolio }) => {
-                                if let Some(portfolio) = portfolio {
-                                    println!("{}", portfolio);
-                                } else {
-                                    println!("No portfolio calculated");
-                                }
+                    };
+                    match client.write(req).await {
+                        Some(Response::SendPortfolio { portfolio }) => {
+                            if let Some(portfolio) = portfolio {
+                                println!("{portfolio}");
+                            } else {
+                                println!("No portfolio calculated");
                             }
-                            Some(_) => error!("Unexpected response"),
-                            None => warn!("No response"),
                         }
+                        Some(_) => error!("Unexpected response"),
+                        None => warn!("No response"),
                     }
-                    Commands::CleanUp => {
-                        let msg = server::Request::CleanUp;
-                        client.write(msg).await.or_else(|| {
-                            warn!("No response");
-                            None
-                        });
-                    }
-                    Commands::GetTransactions { from_date, to_date } => {
-                        dbg!(from_date, to_date);
-                        // let msg = server::Request::GetTransactions { from_date, to_date };
-                        // match client.write(msg).await {
-                        //     Some(Response::SendTransactions { table }) => {
-                        //         if let Some(table) = table {
-                        //             println!("{}", table);
-                        //         } else {
-                        //             println!("No transactions found");
-                        //         }
-                        //     }
-                        //     Some(_) => error!("Unexpected response"),
-                        //     None => warn!("No response"),
-                        // }
-                    }
-                    Commands::GetOrders => {
-                        let msg = server::Request::GetOrders;
-                        match client.write(msg).await {
-                            Some(Response::SendOrders { table }) => {
-                                if let Some(table) = table {
-                                    println!("{}", table);
-                                } else {
-                                    println!("No orders found");
-                                }
+                }
+                Commands::CleanUp => {
+                    let msg = server::Request::CleanUp;
+                    client.write(msg).await.or_else(|| {
+                        warn!("No response");
+                        None
+                    });
+                }
+                Commands::GetTransactions { from_date, to_date } => {
+                    dbg!(from_date, to_date);
+                    // let msg = server::Request::GetTransactions { from_date, to_date };
+                    // match client.write(msg).await {
+                    //     Some(Response::SendTransactions { table }) => {
+                    //         if let Some(table) = table {
+                    //             println!("{}", table);
+                    //         } else {
+                    //             println!("No transactions found");
+                    //         }
+                    //     }
+                    //     Some(_) => error!("Unexpected response"),
+                    //     None => warn!("No response"),
+                    // }
+                }
+                Commands::GetOrders => {
+                    let msg = server::Request::GetOrders;
+                    match client.write(msg).await {
+                        Some(Response::SendOrders { table }) => {
+                            if let Some(table) = table {
+                                println!("{table}");
+                            } else {
+                                println!("No orders found");
                             }
-                            Some(_) => error!("Unexpected response"),
-                            None => warn!("No response"),
                         }
+                        Some(_) => error!("Unexpected response"),
+                        None => warn!("No response"),
                     }
                 }
             }
-            None => {
-                let addr = Ipv4Addr::new(127, 0, 0, 1);
-                let socket = SocketAddrV4::new(addr, port);
-                match server::Server::new(socket).await {
-                    Ok(server) => {
-                        let mop = MasterOfPuppets::default();
-                        let settings = Settings::new(None);
-                        let _settings_address = PuppetBuilder::new(settings.clone())
-                            .spawn(&mop)
-                            .await
-                            .unwrap();
-                        let server_address = PuppetBuilder::new(server).spawn(&mop).await.unwrap();
-                        server_address.send(server::RunServer).await.unwrap();
-                        let _db_address = PuppetBuilder::new(Db::new()).spawn(&mop).await.unwrap();
-                        let degiro = Degiro::new(&settings.username, &settings.password).unwrap();
-                        let _degiro_address = PuppetBuilder::new(degiro).spawn(&mop).await.unwrap();
-                        let _calculator_address =
-                            PuppetBuilder::new(Calculator::new(settings.clone()))
-                                .spawn(&mop)
-                                .await
-                                .unwrap();
-                    }
-                    Err(err) => println!("{err}"),
+        } else {
+            let addr = Ipv4Addr::new(127, 0, 0, 1);
+            let socket = SocketAddrV4::new(addr, port);
+            match server::Server::new(socket).await {
+                Ok(server) => {
+                    let mop = MasterOfPuppets::default();
+                    let settings = Settings::new(None);
+                    let _settings_address = PuppetBuilder::new(settings.clone())
+                        .spawn(&mop)
+                        .await
+                        .unwrap();
+                    let server_address = PuppetBuilder::new(server).spawn(&mop).await.unwrap();
+                    server_address.send(server::RunServer).await.unwrap();
+                    let _db_address = PuppetBuilder::new(Db::new()).spawn(&mop).await.unwrap();
+                    let degiro = Degiro::new(&settings.username, &settings.password).unwrap();
+                    let _degiro_address = PuppetBuilder::new(degiro).spawn(&mop).await.unwrap();
+                    let _calculator_address = PuppetBuilder::new(Calculator::new(settings.clone()))
+                        .spawn(&mop)
+                        .await
+                        .unwrap();
                 }
+                Err(err) => println!("{err}"),
+            }
 
-                tokio::select! {
-                    _ = signal::ctrl_c() => {
-                        println!("Ctrl-C received, shutting down");
-                    },
-                }
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    println!("Ctrl-C received, shutting down");
+                },
             }
         };
         Ok(())

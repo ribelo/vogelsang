@@ -222,7 +222,7 @@ impl Handler<ProductQuery> for Db {
                 }
             }
             ProductQuery::Name(name) => {
-                let rgx = regex::Regex::new(&format!("(?i){}", name)).unwrap();
+                let rgx = regex::Regex::new(&format!("(?i){name}")).unwrap();
                 let mut iter = self
                     .products
                     .iter(&rtxn)
@@ -304,7 +304,7 @@ impl Handler<CandlesQuery> for Db {
                 return Ok(None);
             }
             CandlesQuery::Name(name) => {
-                let rgx = regex::Regex::new(&format!("(?i){}", name)).unwrap();
+                let rgx = regex::Regex::new(&format!("(?i){name}")).unwrap();
                 let new_msg = {
                     let rtxn = self
                         .env
@@ -396,7 +396,7 @@ impl Handler<FinanclaReportsQuery> for Db {
                 return Ok(None);
             }
             FinanclaReportsQuery::Name(name) => {
-                let rgx = regex::Regex::new(&format!("(?i){}", name)).unwrap();
+                let rgx = regex::Regex::new(&format!("(?i){name}")).unwrap();
                 let new_msg = {
                     let rtxn = self
                         .env
@@ -488,7 +488,7 @@ impl Handler<CompanyRatiosQuery> for Db {
                 return Ok(None);
             }
             CompanyRatiosQuery::Name(name) => {
-                let rgx = regex::Regex::new(&format!("(?i){}", name)).unwrap();
+                let rgx = regex::Regex::new(&format!("(?i){name}")).unwrap();
                 let new_msg = {
                     let rtxn = self
                         .env

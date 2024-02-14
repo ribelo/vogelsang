@@ -219,7 +219,7 @@ fn na_covariance(matrix: &na::DMatrix<f64>) -> na::DMatrix<f64> {
 }
 
 impl AssetsSeq {
-    pub async fn redp_multiple_allocation(
+    pub fn redp_multiple_allocation(
         &self,
         mode: RiskMode,
         risk: f64,
