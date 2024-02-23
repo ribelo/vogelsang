@@ -10,7 +10,7 @@ use degiro_rs::{
 };
 use erfurt::candle::{Candles, CandlesExt};
 use itertools::Itertools;
-use master_of_puppets::prelude::*;
+use pptr::prelude::*;
 use qualsdorf::{
     average_drawdown::AverageDrawdownExt, rolling_economic_drawdown::RollingEconomicDrawdownExt,
     rsi::RsiExt, sharpe_ratio::SharpeRatioExt, Indicator,
@@ -23,8 +23,8 @@ use crate::{
 };
 
 use super::{
-    db::{CandlesQuery, CompanyRatiosQuery, Db, FinanclaReportsQuery, ProductQuery},
-    settings::Settings,
+    db::{CandlesQuery, CompanyRatiosQuery, Db, FinancilaReportsQuery, ProductQuery},
+    settings::{Asset, Settings},
 };
 
 #[derive(Debug, Clone)]
@@ -43,7 +43,7 @@ impl Calculator {
 impl Lifecycle for Calculator {
     type Supervision = OneToOne;
 
-    async fn reset(&self, _puppeter: &Puppeter) -> Result<Self, CriticalError> {
+    async fn reset(&self, _ctx: &Context) -> Result<Self, CriticalError> {
         Ok(Self::new(self.settings.clone()))
     }
 }
@@ -65,15 +65,15 @@ impl Handler<GetSingleAllocation> for Calculator {
     async fn handle_message(
         &mut self,
         msg: GetSingleAllocation,
-        puppeter: &Puppeter,
+        ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
-        if let Some(candles) = puppeter.ask::<Db, _>(msg.query.clone()).await? {
+        if let Some(candles) = ctx.ask::<Db, _>(msg.query.clone()).await? {
             let allocation = candles
                 .single_allocation(msg.mode, msg.risk, msg.risk_free, Period::P1Y, Period::P1M)
                 .await
                 .map_err(|e| {
                     error!(error = %e, "Failed to calculate single allocation");
-                    puppeter.critical_error(&e)
+                    ctx.critical_error(&e)
                 })?;
             Ok(Some(allocation))
         } else {
@@ -132,18 +132,14 @@ impl Handler<GetDataEntry> for Calculator {
     async fn handle_message(
         &mut self,
         msg: GetDataEntry,
-        puppeter: &Puppeter,
+        ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
-        let candles = puppeter
-            .ask::<Db, _>(CandlesQuery::Id(msg.id.clone()))
+        let candles = ctx.ask::<Db, _>(CandlesQuery::Id(msg.id.clone())).await?;
+        let product = ctx.ask::<Db, _>(ProductQuery::Id(msg.id.clone())).await?;
+        let financials = ctx
+            .ask::<Db, _>(FinancilaReportsQuery::Id(msg.id.clone()))
             .await?;
-        let product = puppeter
-            .ask::<Db, _>(ProductQuery::Id(msg.id.clone()))
-            .await?;
-        let financials = puppeter
-            .ask::<Db, _>(FinanclaReportsQuery::Id(msg.id.clone()))
-            .await?;
-        let ratios = puppeter
+        let ratios = ctx
             .ask::<Db, _>(CompanyRatiosQuery::Id(msg.id.clone()))
             .await?;
         match (candles, product, financials, ratios) {
@@ -215,17 +211,17 @@ impl Handler<CalculatePortfolio> for Calculator {
     async fn handle_message(
         &mut self,
         msg: CalculatePortfolio,
-        puppeter: &Puppeter,
+        ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
         let data = DashMap::new();
-        for (id, _) in &self.settings.assets {
+        for Asset { id, .. } in &self.settings.assets {
             let get_data_entry = GetDataEntry {
                 id: id.clone(),
                 risk: msg.risk,
                 risk_free: msg.risk_free,
                 freq: msg.freq,
             };
-            if let Some(entry) = puppeter.ask::<Self, _>(get_data_entry).await? {
+            if let Some(entry) = ctx.ask::<Self, _>(get_data_entry).await? {
                 data.insert(id.clone(), entry);
             }
         }
@@ -533,11 +529,11 @@ impl Handler<CalculateSl> for Calculator {
     async fn handle_message(
         &mut self,
         msg: CalculateSl,
-        puppeter: &Puppeter,
+        ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
         info!("Calculating stop losses...");
-        let portfolio = puppeter.ask::<Degiro, _>(GetPortfolio).await?;
-        let orders = puppeter.ask::<Degiro, _>(GetOrders).await?;
+        let portfolio = ctx.ask::<Degiro, _>(GetPortfolio).await?;
+        let orders = ctx.ask::<Degiro, _>(GetOrders).await?;
         let mut table = comfy_table::Table::new();
         let header = vec![
             comfy_table::Cell::new("id"),
@@ -558,10 +554,10 @@ impl Handler<CalculateSl> for Calculator {
             if position.inner.size <= 0.0 {
                 continue;
             }
-            let product = puppeter
+            let product = ctx
                 .ask::<Db, _>(ProductQuery::Id(position.inner.id.clone()))
                 .await?;
-            let candles = puppeter
+            let candles = ctx
                 .ask::<Db, _>(CandlesQuery::Id(position.inner.id.clone()))
                 .await?;
             let old_sl = orders
@@ -572,10 +568,10 @@ impl Handler<CalculateSl> for Calculator {
                 if let Some(avg_dd) = candles.average_drawdown(12) {
                     if let Some(Some(avg_dd_value)) = avg_dd.values.last() {
                         let Some(last_price) = candles.close.last() else {
-                            return Err(puppeter.critical_error("Failed to get last price"));
+                            return Err(ctx.critical_error("Failed to get last price"));
                         };
                         let Some(last_time) = candles.time.last() else {
-                            return Err(puppeter.critical_error("Failed to get last time"));
+                            return Err(ctx.critical_error("Failed to get last time"));
                         };
                         let std_stop = last_price * (1.0 - avg_dd_value * msg.nstd as f64);
                         let min_stop = last_price * (1.0 - msg.max_percent.unwrap_or(1.0));
@@ -628,9 +624,9 @@ impl Handler<GetPortfolio> for Calculator {
     async fn handle_message(
         &mut self,
         _msg: GetPortfolio,
-        puppeter: &Puppeter,
+        ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
-        let portfolio = puppeter.ask::<Degiro, _>(GetPortfolio).await?;
+        let portfolio = ctx.ask::<Degiro, _>(GetPortfolio).await?;
         let mut table = comfy_table::Table::new();
         let header = vec![
             comfy_table::Cell::new("id"),
@@ -650,13 +646,13 @@ impl Handler<GetPortfolio> for Calculator {
             if position.inner.size <= 0.0 {
                 continue;
             }
-            let product = puppeter
+            let product = ctx
                 .ask::<Db, _>(ProductQuery::Id(position.inner.id.clone()))
                 .await?;
-            let financials = puppeter
-                .ask::<Db, _>(FinanclaReportsQuery::Id(position.inner.id.clone()))
+            let financials = ctx
+                .ask::<Db, _>(FinancilaReportsQuery::Id(position.inner.id.clone()))
                 .await?;
-            let ratios = puppeter
+            let ratios = ctx
                 .ask::<Db, _>(CompanyRatiosQuery::Id(position.inner.id.clone()))
                 .await?;
             if let (Some(product), Some(financials), Some(ratios)) = (product, financials, ratios) {

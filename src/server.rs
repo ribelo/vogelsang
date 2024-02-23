@@ -9,7 +9,7 @@ use comfy_table::presets::UTF8_BORDERS_ONLY;
 use degiro_rs::api::{financial_statements::FinancialReports, product::ProductDetails};
 use erfurt::prelude::Candles;
 use futures::SinkExt;
-use master_of_puppets::{
+use pptr::{
     message::ServiceCommand, prelude::*, puppet::Lifecycle, supervision::strategy::OneToOne,
 };
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use tracing::{error, info};
 use crate::{
     portfolio::RiskMode,
     puppet::{
-        db::{CandlesQuery, CleanUp, Db, FinanclaReportsQuery, ProductQuery},
+        db::{CandlesQuery, CleanUp, Db, FinancilaReportsQuery, ProductQuery},
         degiro::{Authorize, Degiro, FetchData, GetOrders, GetPortfolio, GetTransactions},
         portfolio::{CalculatePortfolio, CalculateSl, Calculator, GetSingleAllocation},
     },
@@ -49,14 +49,14 @@ pub struct Server {
 impl Lifecycle for Server {
     type Supervision = OneToOne;
 
-    async fn reset(&self, puppeter: &Puppeter) -> Result<Self, CriticalError> {
+    async fn reset(&self, ctx: &Context) -> Result<Self, CriticalError> {
         let socket: SocketAddrV4 = self.addr.parse().map_err(|_err| CriticalError {
-            puppet: puppeter.pid,
+            puppet: ctx.pid,
             message: "Can't parse address".to_string(),
         })?;
 
         Self::new(socket).await.map_err(|e| CriticalError {
-            puppet: puppeter.pid,
+            puppet: ctx.pid,
             message: e.to_string(),
         })
     }
@@ -184,18 +184,18 @@ impl Handler<RunServer> for Server {
     async fn handle_message(
         &mut self,
         _msg: RunServer,
-        puppeter: &Puppeter,
+        ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
         info!("Starting server on {}", self.addr);
         let cloned_self = self.clone();
-        let cloned_puppeter = puppeter.clone();
+        let cloned_ctx = ctx.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = cloned_self.listener.accept().await else {
-                    let err = cloned_puppeter.critical_error("Can't accept connection");
-                    let _ = cloned_puppeter
+                    let err = cloned_ctx.critical_error("Can't accept connection");
+                    let _ = cloned_ctx
                         .send_command::<Self>(ServiceCommand::ReportFailure {
-                            pid: cloned_puppeter.pid,
+                            pid: cloned_ctx.pid,
                             error: err,
                         })
                         .await;
@@ -205,26 +205,26 @@ impl Handler<RunServer> for Server {
                 // TODO:
                 let (res_tx, mut res_rx) =
                     tokio::sync::mpsc::unbounded_channel::<Option<Response>>();
-                let cloned_puppeter = cloned_puppeter.clone();
+                let cloned_ctx = cloned_ctx.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
                             Some(msg) = res_rx.recv() => {
                                 let Ok(bytes) = bincode::serialize(&msg) else {
-                                    return Err(cloned_puppeter.critical_error("Can't serialize message"))
+                                    return Err(cloned_ctx.critical_error("Can't serialize message"))
                                 };
                                 if frame.send(bytes.into()).await.is_err() {
-                                    return Err(cloned_puppeter.critical_error( "Can't send message"))
+                                    return Err(cloned_ctx.critical_error( "Can't send message"))
                                 };
                             }
                             framed = frame.next() => {
                                 match framed {
                                     Some(Ok(buf)) => {
                                         let Ok(req) = bincode::deserialize::<Request>(&buf) else {
-                                            return Err(cloned_puppeter.critical_error("Can't deserialize message"))
+                                            return Err(cloned_ctx.critical_error("Can't deserialize message"))
                                         };
                                         info!(req =? req, "Received message");
-                                        req.process(&res_tx, &cloned_puppeter).await;
+                                        req.process(&res_tx, &cloned_ctx).await;
                                     }
                                     Some(Err(err)) => {
                                         eprintln!("{err}");
@@ -294,27 +294,24 @@ impl Request {
     pub async fn process(
         self,
         res_tx: &tokio::sync::mpsc::UnboundedSender<Option<Response>>,
-        puppeter: &Puppeter,
+        ctx: &Context,
     ) {
         match self {
             Self::Authorize => {
-                puppeter
-                    .ask::<Degiro, _>(Authorize)
-                    .await
-                    .unwrap_or_else(|err| {
-                        tracing::error!(error = %err, "Failed to authorize");
-                    });
+                ctx.ask::<Degiro, _>(Authorize).await.unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "Failed to authorize");
+                });
                 res_tx.send(None).unwrap();
             }
             Self::FetchData { id } => {
                 let msg = FetchData { id, name: None };
-                puppeter.send::<Degiro, _>(msg).await.unwrap_or_else(|err| {
+                ctx.send::<Degiro, _>(msg).await.unwrap_or_else(|err| {
                     tracing::error!(error = %err, "Failed to fetch data");
                 });
                 res_tx.send(None).unwrap();
             }
             Self::GetProduct { query } => {
-                let product = puppeter.ask::<Db, _>(query).await.unwrap_or_else(|err| {
+                let product = ctx.ask::<Db, _>(query).await.unwrap_or_else(|err| {
                     tracing::error!(error = %err, "Failed to get product");
                     None
                 });
@@ -323,8 +320,8 @@ impl Request {
                     .unwrap();
             }
             Self::GetFinancials { query } => {
-                let financials = puppeter
-                    .ask::<Db, _>(FinanclaReportsQuery::from(query))
+                let financials = ctx
+                    .ask::<Db, _>(FinancilaReportsQuery::from(query))
                     .await
                     .unwrap_or_else(|err| {
                         tracing::error!(error = %err, "Failed to get product");
@@ -335,7 +332,7 @@ impl Request {
                     .unwrap();
             }
             Self::GetCandles { query } => {
-                let candles = puppeter
+                let candles = ctx
                     .ask::<Db, _>(CandlesQuery::from(query))
                     .await
                     .unwrap_or_else(|err| {
@@ -358,13 +355,10 @@ impl Request {
                     risk,
                     risk_free,
                 };
-                let allocation = puppeter
-                    .ask::<Calculator, _>(msg)
-                    .await
-                    .unwrap_or_else(|err| {
-                        tracing::error!(error = %err, "Failed to get single allocation");
-                        None
-                    });
+                let allocation = ctx.ask::<Calculator, _>(msg).await.unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "Failed to get single allocation");
+                    None
+                });
                 res_tx
                     .send(Some(Response::SendSingleAllocation {
                         single_allocation: allocation,
@@ -405,28 +399,28 @@ impl Request {
                     min_roic,
                     roic_wacc_delta,
                 };
-                let portfolio = puppeter.ask::<Calculator, _>(msg).await.ok();
+                let portfolio = ctx.ask::<Calculator, _>(msg).await.ok();
                 res_tx
                     .send(Some(Response::SendPortfolio { portfolio }))
                     .unwrap();
             }
             Self::RecalculateSl { nstd, max_percent } => {
                 let msg = CalculateSl { nstd, max_percent };
-                let table = puppeter.ask::<Calculator, _>(msg).await.ok();
+                let table = ctx.ask::<Calculator, _>(msg).await.ok();
                 res_tx
                     .send(Some(Response::SendRecalcucatetSl { table }))
                     .unwrap();
             }
             Self::GetPortfolio => {
                 let msg = GetPortfolio;
-                let portfolio = puppeter.ask::<Calculator, _>(msg).await.ok();
+                let portfolio = ctx.ask::<Calculator, _>(msg).await.ok();
                 res_tx
                     .send(Some(Response::SendPortfolio { portfolio }))
                     .unwrap();
             }
             Self::GetTransactions { from_date, to_date } => {
                 let msg = GetTransactions { from_date, to_date };
-                let transactions = puppeter.ask::<Degiro, _>(msg).await.ok();
+                let transactions = ctx.ask::<Degiro, _>(msg).await.ok();
                 let mut table = comfy_table::Table::new();
                 let header = vec![
                     comfy_table::Cell::new("id"),
@@ -471,7 +465,7 @@ impl Request {
             }
             Self::GetOrders => {
                 let msg = GetOrders;
-                let orders = puppeter.ask::<Degiro, _>(msg).await.ok();
+                let orders = ctx.ask::<Degiro, _>(msg).await.ok();
                 let mut table = comfy_table::Table::new();
                 let header = vec![
                     comfy_table::Cell::new("product id"),
@@ -508,7 +502,7 @@ impl Request {
             }
             Self::CleanUp => {
                 let msg = CleanUp;
-                puppeter.send::<Db, _>(msg).await.ok();
+                ctx.send::<Db, _>(msg).await.ok();
                 res_tx.send(Some(Response::SendCleanUp)).unwrap();
             }
         }

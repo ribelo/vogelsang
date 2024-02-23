@@ -13,7 +13,7 @@ members = []
 erfurt = { path = "../erfurt" }
 degiro-rs = { path = "../degiro-rs", features = ["erfurt"] }
 qualsdorf = { path = "../qualsdorf" }
-master-of-puppets = { path = "../master_of_puppets/" }
+pptr = { path = "../pptr/" }
 async-trait = "0.1"
 statrs = "0.16"
 tokio = { version = "1.21.1", features = ["full"] }
@@ -26,7 +26,6 @@ dashmap = "5"
 futures = "0.3"
 comfy-table = "7"
 itertools = "0.12"
-owo-colors = "4.0.0"
 thiserror = "1.0"
 serde_json = "1.0"
 bincode = "1.3.3"
@@ -46,6 +45,9 @@ anyhow = "1.0.79"
 reqwest = { version = "0.11.23", default-features = false }
 egui = "0.26.2"
 eframe = "0.26.2"
+directories = "5.0.1"
+egui_extras = "0.26.2"
+derivative = "2.2.0"
 
 [lints.clippy]
 all = { level = "warn" }

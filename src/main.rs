@@ -9,8 +9,7 @@ pub mod cli;
 pub mod portfolio;
 pub mod puppet;
 pub mod server;
-
-use crate::cli::CliExt;
+pub mod ui;
 
 #[derive(Debug, Clone)]
 pub struct App;

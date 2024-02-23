@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use clap::{ArgGroup, Parser, Subcommand};
 use degiro_rs::util::ProductCategory;
-use master_of_puppets::{master_of_puppets::MasterOfPuppets, puppet::PuppetBuilder};
+use pptr::{puppet::PuppetBuilder, puppeter::Puppeter};
 use tokio::signal;
 use tracing::{error, info, warn};
 
@@ -18,7 +18,7 @@ use crate::{
         settings::Settings,
     },
     server::{self, ClientBuilder, Response},
-    App,
+    ui, App,
 };
 
 #[derive(Debug, Parser)]
@@ -31,7 +31,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    Authorize {},
+    Server,
     FetchData {
         id: Option<String>,
     },
@@ -126,14 +126,8 @@ pub enum Commands {
     CleanUp,
 }
 
-#[async_trait]
-pub trait CliExt {
-    async fn run(self) -> Result<()>;
-}
-
-#[async_trait]
-impl CliExt for App {
-    async fn run(self) -> Result<()> {
+impl App {
+    pub async fn run(self) -> Result<()> {
         let cli = Cli::parse();
         let port = cli.port;
         if let Some(cmd) = cli.command {
@@ -141,14 +135,6 @@ impl CliExt for App {
             let socket = SocketAddrV4::new(addr, port);
             let mut client = ClientBuilder::new(socket).build().await.unwrap();
             match cmd {
-                Commands::Authorize {} => {
-                    info!("Authorizing...");
-                    let msg = server::Request::Authorize {};
-                    client.write(msg).await.or_else(|| {
-                        warn!("No response");
-                        None
-                    });
-                }
                 Commands::FetchData { id } => {
                     let msg = server::Request::FetchData { id };
                     client.write(msg).await.or_else(|| {
@@ -359,35 +345,65 @@ impl CliExt for App {
                         None => warn!("No response"),
                     }
                 }
+                Commands::Server => {
+                    let addr = Ipv4Addr::new(127, 0, 0, 1);
+                    let socket = SocketAddrV4::new(addr, port);
+                    match server::Server::new(socket).await {
+                        Ok(server) => {
+                            let pptr = Puppeter::default();
+                            let settings = Settings::new().await;
+                            let _settings_address = PuppetBuilder::new(settings.clone())
+                                .spawn(&pptr)
+                                .await
+                                .unwrap();
+                            let server_address =
+                                PuppetBuilder::new(server).spawn(&pptr).await.unwrap();
+                            server_address.send(server::RunServer).await.unwrap();
+                            let _db_address =
+                                PuppetBuilder::new(Db::new()).spawn(&pptr).await.unwrap();
+                            let degiro =
+                                Degiro::new(&settings.username, &settings.password).unwrap();
+                            let _degiro_address =
+                                PuppetBuilder::new(degiro).spawn(&pptr).await.unwrap();
+                            let _calculator_address =
+                                PuppetBuilder::new(Calculator::new(settings.clone()))
+                                    .spawn(&pptr)
+                                    .await
+                                    .unwrap();
+                        }
+                        Err(err) => println!("{err}"),
+                    }
+
+                    tokio::select! {
+                        _ = signal::ctrl_c() => {
+                            println!("Ctrl-C received, shutting down");
+                        },
+                    }
+                }
             }
         } else {
             let addr = Ipv4Addr::new(127, 0, 0, 1);
             let socket = SocketAddrV4::new(addr, port);
             match server::Server::new(socket).await {
                 Ok(server) => {
-                    let mop = MasterOfPuppets::default();
-                    let settings = Settings::new(None);
-                    let _settings_address = PuppetBuilder::new(settings.clone())
-                        .spawn(&mop)
+                    let pptr = Puppeter::default();
+                    let settings = Settings::new().await;
+                    PuppetBuilder::new(settings.clone())
+                        .spawn(&pptr)
                         .await
                         .unwrap();
-                    let server_address = PuppetBuilder::new(server).spawn(&mop).await.unwrap();
+                    let server_address = PuppetBuilder::new(server).spawn(&pptr).await.unwrap();
                     server_address.send(server::RunServer).await.unwrap();
-                    let _db_address = PuppetBuilder::new(Db::new()).spawn(&mop).await.unwrap();
+                    PuppetBuilder::new(Db::new()).spawn(&pptr).await.unwrap();
                     let degiro = Degiro::new(&settings.username, &settings.password).unwrap();
-                    let _degiro_address = PuppetBuilder::new(degiro).spawn(&mop).await.unwrap();
-                    let _calculator_address = PuppetBuilder::new(Calculator::new(settings.clone()))
-                        .spawn(&mop)
+                    PuppetBuilder::new(degiro).spawn(&pptr).await.unwrap();
+                    PuppetBuilder::new(Calculator::new(settings.clone()))
+                        .spawn(&pptr)
                         .await
                         .unwrap();
+                    let _r = ui::show(pptr, settings);
                 }
-                Err(err) => println!("{err}"),
-            }
-
-            tokio::select! {
-                _ = signal::ctrl_c() => {
-                    println!("Ctrl-C received, shutting down");
-                },
+                Err(_err) => todo!(),
             }
         };
         Ok(())
