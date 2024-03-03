@@ -1,21 +1,23 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::Result;
-use async_trait::async_trait;
 use chrono::NaiveDate;
 use clap::{ArgGroup, Parser, Subcommand};
 use degiro_rs::util::ProductCategory;
-use pptr::{puppet::PuppetBuilder, puppeter::Puppeter};
-use tokio::signal;
+use pptr::{
+    errors::{PostmanError, PuppetError, PuppetSendMessageError},
+    puppet::PuppetBuilder,
+    puppeter::Puppeter,
+};
 use tracing::{error, info, warn};
 
 use crate::{
     portfolio::RiskMode,
     puppet::{
         db::{Db, ProductQuery},
-        degiro::Degiro,
+        degiro::{Authorize, Degiro, Initialize},
         portfolio::Calculator,
-        settings::Settings,
+        settings::{Config, Settings},
     },
     server::{self, ClientBuilder, Response},
     ui, App,
@@ -346,39 +348,37 @@ impl App {
                     }
                 }
                 Commands::Server => {
-                    let addr = Ipv4Addr::new(127, 0, 0, 1);
-                    let socket = SocketAddrV4::new(addr, port);
-                    match server::Server::new(socket).await {
-                        Ok(server) => {
-                            let pptr = Puppeter::default();
-                            let settings = Settings::new().await;
-                            let _settings_address = PuppetBuilder::new(settings.clone())
-                                .spawn(&pptr)
-                                .await
-                                .unwrap();
-                            let server_address =
-                                PuppetBuilder::new(server).spawn(&pptr).await.unwrap();
-                            server_address.send(server::RunServer).await.unwrap();
-                            let _db_address =
-                                PuppetBuilder::new(Db::new()).spawn(&pptr).await.unwrap();
-                            let degiro =
-                                Degiro::new(&settings.username, &settings.password).unwrap();
-                            let _degiro_address =
-                                PuppetBuilder::new(degiro).spawn(&pptr).await.unwrap();
-                            let _calculator_address =
-                                PuppetBuilder::new(Calculator::new(settings.clone()))
-                                    .spawn(&pptr)
-                                    .await
-                                    .unwrap();
-                        }
-                        Err(err) => println!("{err}"),
-                    }
-
-                    tokio::select! {
-                        _ = signal::ctrl_c() => {
-                            println!("Ctrl-C received, shutting down");
-                        },
-                    }
+                    todo!()
+                    // let addr = Ipv4Addr::new(127, 0, 0, 1);
+                    // let socket = SocketAddrV4::new(addr, port);
+                    // match server::Server::new(socket).await {
+                    //     Ok(server) => {
+                    //         let pptr = Puppeter::default();
+                    //         let config = Config::new().await;
+                    //         let _settings_address =
+                    //             PuppetBuilder::new(Settings).spawn(&pptr).await.unwrap();
+                    //         let server_address =
+                    //             PuppetBuilder::new(server).spawn(&pptr).await.unwrap();
+                    //         server_address.send(server::RunServer).await.unwrap();
+                    //         let _db_address =
+                    //             PuppetBuilder::new(Db::new()).spawn(&pptr).await.unwrap();
+                    //         let degiro = Degiro::new(&config.username, &config.password).unwrap();
+                    //         let _degiro_address =
+                    //             PuppetBuilder::new(degiro).spawn(&pptr).await.unwrap();
+                    //         let _calculator_address = PuppetBuilder::new(Calculator::new())
+                    //             .spawn(&pptr)
+                    //             .await
+                    //             .unwrap();
+                    //         pptr.add_resource(config).unwrap();
+                    //     }
+                    //     Err(err) => println!("{err}"),
+                    // }
+                    //
+                    // tokio::select! {
+                    //     _ = signal::ctrl_c() => {
+                    //         println!("Ctrl-C received, shutting down");
+                    //     },
+                    // }
                 }
             }
         } else {
@@ -387,25 +387,28 @@ impl App {
             match server::Server::new(socket).await {
                 Ok(server) => {
                     let pptr = Puppeter::default();
-                    let settings = Settings::new().await;
-                    PuppetBuilder::new(settings.clone())
-                        .spawn(&pptr)
-                        .await
-                        .unwrap();
+                    let config = Config::new().await;
+                    PuppetBuilder::new(Settings).spawn(&pptr).await.unwrap();
                     let server_address = PuppetBuilder::new(server).spawn(&pptr).await.unwrap();
                     server_address.send(server::RunServer).await.unwrap();
                     PuppetBuilder::new(Db::new()).spawn(&pptr).await.unwrap();
-                    let degiro = Degiro::new(&settings.username, &settings.password).unwrap();
+                    let degiro = Degiro::new(&config.username, &config.password).unwrap();
                     PuppetBuilder::new(degiro).spawn(&pptr).await.unwrap();
-                    PuppetBuilder::new(Calculator::new(settings.clone()))
+                    PuppetBuilder::new(Calculator::new())
                         .spawn(&pptr)
                         .await
                         .unwrap();
-                    let _r = ui::show(pptr, settings);
+                    pptr.add_resource(config).unwrap();
+                    pptr.send::<Degiro, _>(Initialize).await.unwrap();
+                    let _r = ui::show(pptr);
                 }
                 Err(_err) => todo!(),
             }
         };
         Ok(())
     }
+    // let Ok(obj) = env
+    //     .new_object_unchecked(cls, constructor, &offsets_vec[..]) else {
+    //         continue;
+    //     };
 }

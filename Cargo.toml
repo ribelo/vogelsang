@@ -48,6 +48,9 @@ eframe = "0.26.2"
 directories = "5.0.1"
 egui_extras = "0.26.2"
 derivative = "2.2.0"
+parking_lot = "0.12.1"
+reqwest_cookie_store = "0.6.0"
+egui_plot = "0.26.2"
 
 [lints.clippy]
 all = { level = "warn" }

@@ -24,18 +24,16 @@ use crate::{
 
 use super::{
     db::{CandlesQuery, CompanyRatiosQuery, Db, FinancilaReportsQuery, ProductQuery},
-    settings::{Asset, Settings},
+    settings::{Asset, Config},
 };
 
 #[derive(Debug, Clone)]
-pub struct Calculator {
-    settings: Settings,
-}
+pub struct Calculator;
 
 impl Calculator {
     #[must_use]
-    pub const fn new(settings: Settings) -> Self {
-        Self { settings }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -44,7 +42,7 @@ impl Lifecycle for Calculator {
     type Supervision = OneToOne;
 
     async fn reset(&self, _ctx: &Context) -> Result<Self, CriticalError> {
-        Ok(Self::new(self.settings.clone()))
+        Ok(Self::new())
     }
 }
 
@@ -70,7 +68,6 @@ impl Handler<GetSingleAllocation> for Calculator {
         if let Some(candles) = ctx.ask::<Db, _>(msg.query.clone()).await? {
             let allocation = candles
                 .single_allocation(msg.mode, msg.risk, msg.risk_free, Period::P1Y, Period::P1M)
-                .await
                 .map_err(|e| {
                     error!(error = %e, "Failed to calculate single allocation");
                     ctx.critical_error(&e)
@@ -154,7 +151,6 @@ impl Handler<GetDataEntry> for Calculator {
                             Period::P1Y,
                             Period::P1M,
                         )
-                        .await
                         .unwrap();
                     let sharpe_ratio = *candles
                         .sharpe_ratio(msg.freq, msg.risk_free)
@@ -214,7 +210,8 @@ impl Handler<CalculatePortfolio> for Calculator {
         ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
         let data = DashMap::new();
-        for Asset { id, .. } in &self.settings.assets {
+        let config = ctx.expect_resource::<Config>();
+        for Asset { id, .. } in &config.assets {
             let get_data_entry = GetDataEntry {
                 id: id.clone(),
                 risk: msg.risk,
@@ -563,7 +560,7 @@ impl Handler<CalculateSl> for Calculator {
             let old_sl = orders
                 .filter_product_id(product_id)
                 .first()
-                .map(|o| o.stop_price);
+                .map(|o| o.inner.stop_price);
             if let (Some(product), Some(candles)) = (product, candles) {
                 if let Some(avg_dd) = candles.average_drawdown(12) {
                     if let Some(Some(avg_dd_value)) = avg_dd.values.last() {

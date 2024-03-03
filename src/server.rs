@@ -304,7 +304,7 @@ impl Request {
                 res_tx.send(None).unwrap();
             }
             Self::FetchData { id } => {
-                let msg = FetchData { id, name: None };
+                let msg = FetchData { id };
                 ctx.send::<Degiro, _>(msg).await.unwrap_or_else(|err| {
                     tracing::error!(error = %err, "Failed to fetch data");
                 });
@@ -482,14 +482,14 @@ impl Request {
                 if let Some(orders) = orders {
                     for order in orders.iter() {
                         table.add_row(vec![
-                            comfy_table::Cell::new(order.product_id.to_string()),
-                            comfy_table::Cell::new(order.product.to_string()),
-                            comfy_table::Cell::new(order.transaction_type.to_string()),
-                            comfy_table::Cell::new(order.quantity.to_string())
+                            comfy_table::Cell::new(order.inner.product_id.to_string()),
+                            comfy_table::Cell::new(order.inner.product.to_string()),
+                            comfy_table::Cell::new(order.inner.transaction_type.to_string()),
+                            comfy_table::Cell::new(order.inner.quantity.to_string())
                                 .set_alignment(comfy_table::CellAlignment::Right),
-                            comfy_table::Cell::new(order.stop_price.to_string())
+                            comfy_table::Cell::new(order.inner.stop_price.to_string())
                                 .set_alignment(comfy_table::CellAlignment::Right),
-                            comfy_table::Cell::new(order.total_order_value.to_string())
+                            comfy_table::Cell::new(order.inner.total_order_value.to_string())
                                 .set_alignment(comfy_table::CellAlignment::Right),
                         ]);
                     }

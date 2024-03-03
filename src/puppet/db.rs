@@ -10,7 +10,7 @@ use pptr::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use super::settings::{Asset, GetSettings, Settings};
+use super::settings::{Asset, Config, Settings};
 
 #[derive(Clone)]
 pub struct Db {
@@ -521,12 +521,8 @@ impl Handler<CleanUp> for Db {
         _msg: CleanUp,
         ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
-        let settings = ctx.ask::<Settings, _>(GetSettings).await.map_err(|e| {
-            error!(error = %e, "Failed to get settings");
-            ctx.critical_error(&e)
-        })?;
-
-        let assets = settings
+        let config = ctx.expect_resource::<Config>();
+        let assets = config
             .assets
             .iter()
             .map(|Asset { id, .. }| id.clone())

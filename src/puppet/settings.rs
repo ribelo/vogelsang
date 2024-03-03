@@ -1,22 +1,29 @@
 use async_trait::async_trait;
-use config::Config;
+use config::Config as Cfg;
 use directories;
 use pptr::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
+use crate::portfolio::RiskMode;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Asset {
     pub id: String,
-    pub name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
-pub struct Settings {
+pub struct Config {
     #[serde(default)]
     pub sl_nstd: usize,
     #[serde(default)]
-    pub sl_max_percent: f64,
+    pub sl_max_dd: f64,
+    #[serde(default)]
+    pub risk_mode: RiskMode,
+    #[serde(default)]
+    pub risk: f64,
+    #[serde(default)]
+    pub risk_free: f64,
     #[serde(skip)]
     pub file_path: Option<String>,
     #[serde(skip_serializing)]
@@ -27,7 +34,7 @@ pub struct Settings {
     pub disabled_assets: Option<Vec<Asset>>,
 }
 
-impl Settings {
+impl Config {
     #[must_use]
     pub async fn new() -> Self {
         let base_dir = directories::BaseDirs::new().expect("Can't get base dirs");
@@ -41,14 +48,14 @@ impl Settings {
             tokio::fs::create_dir_all(&config_dir)
                 .await
                 .expect("Can't create config dir");
-            let settings = Self::default();
-            let toml = toml::to_string_pretty(&settings).unwrap();
+            let inner = Config::default();
+            let toml = toml::to_string_pretty(&inner).unwrap();
             tokio::fs::write(format!("{config_dir}/Config.toml"), toml)
                 .await
                 .expect("Can't write config");
             info!("Created config at {}", config_dir);
         }
-        let settings = Config::builder()
+        let cfg = Cfg::builder()
             .set_default(
                 "username",
                 std::env::var("DEGIRO_LOGIN").unwrap_or_default(),
@@ -62,20 +69,24 @@ impl Settings {
             .add_source(config::File::with_name(&format!("{config_dir}/Config")))
             .build()
             .expect("Can't load config");
-        let mut settings = settings
-            .try_deserialize::<Self>()
+        let mut config = cfg
+            .try_deserialize::<Config>()
             .expect("Can't deserialize config");
-        settings.file_path = Some(format!("{config_dir}/Config.toml"));
-        settings
+        config.file_path = Some(format!("{config_dir}/Config.toml"));
+
+        config
     }
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct Settings;
 
 #[async_trait]
 impl Lifecycle for Settings {
     type Supervision = OneToOne;
 
     async fn reset(&self, _ctx: &Context) -> Result<Self, CriticalError> {
-        Ok(Self::new().await)
+        Ok(Self)
     }
 }
 
@@ -91,13 +102,15 @@ impl Handler<SaveSettings> for Settings {
         _msg: SaveSettings,
         ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
-        let path = self.file_path.as_ref().unwrap();
-        let toml = toml::to_string_pretty(self).unwrap();
-        tokio::fs::write(&path, toml).await.map_err(|e| {
-            error!("Can't save config: {}", e);
-            ctx.critical_error(&e)
-        })?;
-        info!("Saved config to {}", path);
+        if let Some(config) = ctx.get_resource::<Config>() {
+            let path = config.file_path.as_ref().unwrap().clone();
+            let toml = toml::to_string_pretty(&config).unwrap();
+            tokio::fs::write(&path, toml).await.map_err(|e| {
+                error!("Can't save config: {}", e);
+                ctx.critical_error(&e)
+            })?;
+            info!("Saved config to {}", path);
+        };
         Ok(())
     }
 }
@@ -121,35 +134,29 @@ impl Handler<ReplaceSettings> for Settings {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct GetSettings;
+pub struct GetAssets;
 
 #[async_trait]
-impl Handler<GetSettings> for Settings {
-    type Response = Self;
-
+impl Handler<GetAssets> for Settings {
+    type Response = Vec<Asset>;
     type Executor = SequentialExecutor;
-
     async fn handle_message(
         &mut self,
-        _msg: GetSettings,
-        _ctx: &Context,
+        msg: GetAssets,
+        ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
-        Ok(self.clone())
+        Ok(ctx.expect_resource::<Config>().assets)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct AddAsset {
     pub id: String,
-    pub name: String,
 }
 
 impl From<AddAsset> for Asset {
     fn from(msg: AddAsset) -> Self {
-        Self {
-            id: msg.id,
-            name: msg.name,
-        }
+        Self { id: msg.id }
     }
 }
 
@@ -165,7 +172,10 @@ impl Handler<AddAsset> for Settings {
         ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
         info!("Adding asset: {:?}", msg);
-        self.assets.push(msg.into());
+        ctx.with_resource_mut(|config: &mut Config| {
+            config.assets.push(msg.into());
+        })
+        .unwrap();
         ctx.send::<Self, _>(SaveSettings).await?;
         Ok(())
     }
@@ -184,31 +194,30 @@ impl Handler<DeleteAsset> for Settings {
         ctx: &Context,
     ) -> Result<Self::Response, PuppetError> {
         info!("Removing asset: {:?}", msg.0);
-        if let Some(pos) = self.assets.iter().position(|x| x.id == msg.0) {
-            let asset = self.assets.remove(pos);
-            if let Some(disabled_assets) = &mut self.disabled_assets {
-                disabled_assets.push(asset);
-            } else {
-                self.disabled_assets = Some(vec![asset]);
-            }
+
+        let removal_info = ctx
+            .with_resource(|config: &Config| {
+                config
+                    .assets
+                    .iter()
+                    .enumerate()
+                    .find_map(|(pos, asset)| (asset.id == msg.0).then(|| (pos, asset.clone())))
+            })
+            .flatten();
+        let changed = removal_info.map_or(false, |(pos, asset)| {
+            ctx.with_resource_mut(|config: &mut Config| {
+                config
+                    .disabled_assets
+                    .get_or_insert_with(Vec::new)
+                    .push(asset);
+                config.assets.remove(pos);
+                true
+            })
+            .unwrap_or_default()
+        });
+        if changed {
             ctx.send::<Self, _>(SaveSettings).await?;
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GetAssets;
-
-#[async_trait]
-impl Handler<GetAssets> for Settings {
-    type Response = Vec<Asset>;
-    type Executor = SequentialExecutor;
-    async fn handle_message(
-        &mut self,
-        _msg: GetAssets,
-        _ctx: &Context,
-    ) -> Result<Self::Response, PuppetError> {
-        Ok(self.assets.clone())
     }
 }

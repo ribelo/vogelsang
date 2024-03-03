@@ -82,15 +82,16 @@ pub trait LsvExt: ReturnExt {
 
 impl<T> LsvExt for T where T: CandlesExt {}
 
-#[derive(Debug, Clone, Copy, EnumString, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, EnumString, Serialize, Deserialize)]
 pub enum RiskMode {
+    #[default]
     STD,
     LSV,
 }
 
 #[async_trait]
 pub trait SingleAllocation {
-    async fn single_allocation(
+    fn score(
         &self,
         mode: RiskMode,
         risk: f64,
@@ -98,11 +99,8 @@ pub trait SingleAllocation {
         period: Period,
         interval: Period,
     ) -> Result<f64>;
-}
 
-#[async_trait]
-impl SingleAllocation for Product {
-    async fn single_allocation(
+    fn single_allocation(
         &self,
         mode: RiskMode,
         risk: f64,
@@ -110,16 +108,15 @@ impl SingleAllocation for Product {
         period: Period,
         interval: Period,
     ) -> Result<f64> {
-        let candles: Candles = self.quotes(period, interval).await?.into();
-        candles
-            .single_allocation(mode, risk, risk_free, period, interval)
-            .await
+        Ok(1.0_f64
+            .max(self.score(mode, risk, risk_free, period, interval)?)
+            .max(0.0))
     }
 }
 
 #[async_trait]
 impl SingleAllocation for Quotes {
-    async fn single_allocation(
+    fn score(
         &self,
         mode: RiskMode,
         risk: f64,
@@ -127,15 +124,13 @@ impl SingleAllocation for Quotes {
         period: Period,
         interval: Period,
     ) -> Result<f64> {
-        Into::<Candles>::into(self)
-            .single_allocation(mode, risk, risk_free, period, interval)
-            .await
+        Into::<Candles>::into(self.clone()).score(mode, risk, risk_free, period, interval)
     }
 }
 
 #[async_trait]
 impl SingleAllocation for Candles {
-    async fn single_allocation(
+    fn score(
         &self,
         mode: RiskMode,
         risk: f64,
@@ -170,12 +165,8 @@ impl SingleAllocation for Candles {
             .last()
             .ok_or_else(|| anyhow!("can't get value"))?
             .to_owned();
-        let allocation = 1.0_f64.min(
-            0.0_f64.max(
-                ((sr / risk_metric) + 0.5 / risk.mul_add(-risk, 1.0))
-                    .mul_add(risk, -(redp / (1.0 - redp))),
-            ),
-        );
+        let allocation = ((sr / risk_metric) + 0.5 / risk.mul_add(-risk, 1.0))
+            .mul_add(risk, -(redp / (1.0 - redp)));
         Ok(allocation)
     }
 }
@@ -305,18 +296,17 @@ mod test {
 
     use super::*;
 
-    #[tokio::test]
-    async fn single_allocation() {
-        let client = Client::new_from_env();
-        client.login().await.unwrap();
-        client.account_config().await.unwrap();
-        let product = client.product("1089390").await.unwrap();
-        let allocation = product
-            .single_allocation(RiskMode::STD, 0.3, 0.0, Period::P1Y, Period::P1M)
-            .await
-            .unwrap();
-        dbg!(product, allocation);
-    }
+    // #[tokio::test]
+    // async fn single_allocation() {
+    //     let client = Client::new_from_env();
+    //     client.login().await.unwrap();
+    //     client.account_config().await.unwrap();
+    //     let product = client.product("1089390").await.unwrap();
+    //     let allocation = product
+    //         .single_allocation(RiskMode::STD, 0.3, 0.0, Period::P1Y, Period::P1M)
+    //         .unwrap();
+    //     dbg!(product, allocation);
+    // }
     // TODO:
     // #[tokio::test]
     // async fn multiple_allocation() {
